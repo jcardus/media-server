@@ -7,6 +7,18 @@
 
 logLevel: info
 logDestinations: [stdout]
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
 
 # RTMP — JC400P pushes to rtmp://<host>:1936/live/{channel}/{imei}
 rtmp: yes
@@ -23,8 +35,8 @@ hlsPartDuration: 200ms
 hlsSegmentMaxSize: 50MB
 hlsAllowOrigins: ["*"]
 
-# REST API — list active streams at http://<host>:9997/v3/paths/list
-api: yes
+# REST API disabled; HLS playback does not need it.
+api: no
 apiAddress: :9997
 
 # Accept any path the camera registers (live/{channel}/{imei})
