@@ -12,15 +12,15 @@ logDestinations: [stdout]
 rtmp: yes
 rtmpAddress: :1936
 
-# HLS — viewers pull http://<host>:8881/live/{channel}/{imei}/hls.m3u8
+# HLS — viewers pull http://<host>:8881/live/{channel}/{imei}/index.m3u8
 hls: yes
 hlsAddress: :8881
 hlsEncryption: no
-hlsSegmentCount: 3
+hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
 hlsSegmentMaxSize: 50MB
-hlsAllowOrigin: "*"
+hlsAllowOrigins: ["*"]
 
 # REST API — list active streams at http://<host>:9997/v3/paths/list
 api: yes
