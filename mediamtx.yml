@@ -15,12 +15,15 @@ authInternalUsers:
     ips: []
     permissions:
       - action: publish
+        path:
   - user: any
     pass:
     ips: []
     permissions:
       - action: read
+        path:
       - action: playback
+        path:
   - user: any
     pass:
     ips: ['127.0.0.1', '::1']
