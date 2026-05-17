@@ -1,0 +1,32 @@
+###############################################
+# MediaMTX — Jimi JC400P Media Server
+#
+# Stream path: /live/{channel}/{imei}
+#   e.g. /live/1/862000000000001
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# RTMP — JC400P pushes to rtmp://<host>:1936/live/{channel}/{imei}
+rtmp: yes
+rtmpAddress: :1936
+
+# HLS — viewers pull http://<host>:8881/live/{channel}/{imei}/hls.m3u8
+hls: yes
+hlsAddress: :8881
+hlsEncryption: no
+hlsSegmentCount: 3
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50MB
+hlsAllowOrigin: "*"
+
+# REST API — list active streams at http://<host>:9997/v3/paths/list
+api: yes
+apiAddress: :9997
+
+# Accept any path the camera registers (live/{channel}/{imei})
+paths:
+  "~^.*$":
+    {}
