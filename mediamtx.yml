@@ -8,28 +8,6 @@
 logLevel: info
 logDestinations: [stdout]
 
-authMethod: internal
-authInternalUsers:
-  - user: any
-    pass:
-    ips: []
-    permissions:
-      - action: publish
-        path:
-  - user: any
-    pass:
-    ips: []
-    permissions:
-      - action: read
-        path:
-      - action: playback
-        path:
-  - user: any
-    pass:
-    ips: ['127.0.0.1', '::1']
-    permissions:
-      - action: api
-
 # RTMP — JC400P pushes to rtmp://<host>:1936/live/{channel}/{imei}
 rtmp: yes
 rtmpAddress: :1936
@@ -38,6 +16,7 @@ rtmpAddress: :1936
 hls: yes
 hlsAddress: :8881
 hlsEncryption: no
+hlsVariant: mpegts
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
