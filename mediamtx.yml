@@ -48,7 +48,7 @@ apiAddress: :9997
 # rtc/{ch}/{imei}   — FFmpeg re-encodes AAC→Opus and republishes here; browsers use WHEP on this path
 paths:
   "~^live/.*$":
-    runOnReady: ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp -i rtsp://127.0.0.1:8554/$MTX_PATH -c:v copy -c:a libopus -b:a 32k -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/rtc/$MTX_PATH
+    runOnReady: ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp -i rtsp://127.0.0.1:8554/$MTX_PATH -c:v copy -c:a libopus -b:a 32k -af aresample=async=1000 -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/rtc/$MTX_PATH
     runOnReadyRestart: yes
   "~^rtc/.*$":
     {}
