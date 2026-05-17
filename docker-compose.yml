@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     ports:
       - "1936:1936"   # RTMP — Jimi cameras push to rtmp://host:1936/live/{channel}/{imei} (DNS-only)
-      - "8880:8881"   # HLS  — viewers pull http://host:8880/live/{channel}/{imei}/hls.m3u8 (Cloudflare-proxied)
+      - "80:8881"     # HLS  — viewers pull http://host/live/{channel}/{imei}/hls.m3u8 (Cloudflare-proxied)
       - "9997:9997"   # mediamtx REST API (DNS-only, or use 2052 if you want Cloudflare proxy)
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
