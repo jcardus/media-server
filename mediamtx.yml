@@ -30,7 +30,7 @@ hlsAddress: :8881
 hlsEncryption: no
 hlsVariant: fmp4
 hlsSegmentCount: 3
-hlsSegmentDuration: 1s
+hlsSegmentDuration: 2s
 hlsPartDuration: 200ms
 hlsSegmentMaxSize: 50MB
 hlsAllowOrigins: ["*"]
