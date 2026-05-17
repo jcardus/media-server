@@ -45,6 +45,8 @@ api: no
 apiAddress: :9997
 
 # Accept any path the camera registers (live/{channel}/{imei})
+# audioEncoder transcodes AAC (from RTMP) → Opus (required by WebRTC)
 paths:
   "~^.*$":
-    {}
+    audioEncoder:
+      name: opus
