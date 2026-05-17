@@ -7,7 +7,18 @@
 
 logLevel: info
 logDestinations: [stdout]
-authMethod: none
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
 
 # RTMP — JC400P pushes to rtmp://<host>:1936/live/{channel}/{imei}
 rtmp: yes
