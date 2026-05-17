@@ -5,8 +5,7 @@ services:
     restart: unless-stopped
     ports:
       - "1936:1936"   # RTMP — Jimi cameras push to rtmp://host:1936/live/{channel}/{imei} (DNS-only)
-      - "80:8881"     # HLS  — viewers pull http://host/live/{channel}/{imei}/index.m3u8 (Cloudflare-proxied)
-      - "8889:8889"   # WebRTC — browsers open http://host:8889/live/{channel}/{imei}
+      - "80:8889"     # WebRTC — browsers open https://media.n-gps.com/live/{channel}/{imei} (Cloudflare-proxied)
       - "8189:8189/udp" # WebRTC ICE media
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
