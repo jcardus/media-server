@@ -28,7 +28,7 @@ rtmpAddress: :1936
 hls: yes
 hlsAddress: :8881
 hlsEncryption: no
-hlsVariant: mpegts
+hlsVariant: fmp4
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
