@@ -36,7 +36,7 @@ hlsSegmentMaxSize: 50MB
 hlsAllowOrigins: ["*"]
 
 # WebRTC — browsers open http://<host>:8889/live/{channel}/{imei}
-webrtcAdditionalHosts: [178.105.126.75]
+webrtcAdditionalHosts: [128.140.105.72]
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
