@@ -110,21 +110,25 @@ class Publisher:
         target = f"rtsp://mediamtx:8554/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
+        timestamp_step = round(90000 / float(frame_rate))
+        timestamp_filter = (
+            f"setts=pts=N*{timestamp_step}:dts=N*{timestamp_step}:"
+            f"duration={timestamp_step}:time_base=1/90000"
+        )
         LOGGER.info("starting publisher path=%s codec=%s frameRate=%s", self.path, codec, frame_rate)
         self.process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
             "-loglevel", os.getenv("FFMPEG_LOG_LEVEL", "warning"),
-            "-fflags", "+genpts+nobuffer",
+            "-fflags", "nobuffer",
             "-flags", "low_delay",
-            "-use_wallclock_as_timestamps", "1",
             "-analyzeduration", "1000000",
             "-probesize", "1000000",
-            "-r", frame_rate,
             "-f", codec,
             "-i", "pipe:0",
             "-an",
             "-c:v", "copy",
+            "-bsf:v", timestamp_filter,
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
