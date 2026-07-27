@@ -100,10 +100,10 @@ class PacketParser:
 
 
 class Publisher:
-    def __init__(self, imei: str, channel: int):
+    def __init__(self, imei: str, channel: int, namespace: str):
         channel_offset = int(os.getenv("JT1078_CHANNEL_OFFSET", "1"))
         output_channel = max(0, channel - channel_offset)
-        self.path = f"live/{output_channel}/{imei}"
+        self.path = f"{namespace}/{output_channel}/{imei}"
         self.process = None
 
     async def start(self):
@@ -169,8 +169,9 @@ class Publisher:
 
 
 class Connection:
-    def __init__(self, peer):
+    def __init__(self, peer, namespace: str):
         self.peer = peer
+        self.namespace = namespace
         self.parser = PacketParser()
         self.publishers = {}
         self.fragments = {}
@@ -178,12 +179,14 @@ class Connection:
 
     async def process(self, packet: Packet):
         key = (packet.imei, packet.channel)
-        previous = self.last_sequences.get(key)
+        sequence_key = (packet.imei, packet.channel, packet.data_type)
+        previous = self.last_sequences.get(sequence_key)
         if previous is not None and packet.sequence != (previous + 1) & 0xFFFF:
             LOGGER.warning(
-                "sequence gap peer=%s imei=%s channel=%d expected=%d received=%d",
-                self.peer, packet.imei, packet.channel, (previous + 1) & 0xFFFF, packet.sequence)
-        self.last_sequences[key] = packet.sequence
+                "sequence gap peer=%s imei=%s channel=%d dataType=%d expected=%d received=%d",
+                self.peer, packet.imei, packet.channel, packet.data_type,
+                (previous + 1) & 0xFFFF, packet.sequence)
+        self.last_sequences[sequence_key] = packet.sequence
 
         if packet.data_type == 3:
             return  # Audio is intentionally omitted; browsers receive video-only WebRTC.
@@ -207,7 +210,7 @@ class Connection:
 
         publisher = self.publishers.get(key)
         if publisher is None:
-            publisher = Publisher(*key)
+            publisher = Publisher(*key, self.namespace)
             self.publishers[key] = publisher
         await publisher.write(frame)
 
@@ -215,10 +218,11 @@ class Connection:
         await asyncio.gather(*(publisher.close() for publisher in self.publishers.values()), return_exceptions=True)
 
 
-async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+async def handle_connection(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter, namespace: str):
     peer = writer.get_extra_info("peername")
-    connection = Connection(peer)
-    LOGGER.info("camera connected peer=%s", peer)
+    connection = Connection(peer, namespace)
+    LOGGER.info("camera connected peer=%s namespace=%s", peer, namespace)
     try:
         while data := await reader.read(65536):
             for packet in connection.parser.feed(data):
@@ -231,15 +235,24 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
         await connection.close()
         writer.close()
         await writer.wait_closed()
-        LOGGER.info("camera disconnected peer=%s", peer)
+        LOGGER.info("camera disconnected peer=%s namespace=%s", peer, namespace)
 
 
 async def main():
-    port = int(os.getenv("JT1078_PORT", "10002"))
-    server = await asyncio.start_server(handle_connection, "0.0.0.0", port)
-    LOGGER.info("JT1078 TCP receiver listening on %s", ", ".join(str(sock.getsockname()) for sock in server.sockets))
-    async with server:
-        await server.serve_forever()
+    live_port = int(os.getenv("JT1078_LIVE_PORT", "10002"))
+    playback_port = int(os.getenv("JT1078_PLAYBACK_PORT", "10003"))
+    live_server = await asyncio.start_server(
+        lambda reader, writer: handle_connection(reader, writer, "live"),
+        "0.0.0.0", live_port)
+    playback_server = await asyncio.start_server(
+        lambda reader, writer: handle_connection(reader, writer, "playback"),
+        "0.0.0.0", playback_port)
+    LOGGER.info("JT1078 live receiver listening on port %d", live_port)
+    LOGGER.info("JT1078 playback receiver listening on port %d", playback_port)
+    async with live_server, playback_server:
+        await asyncio.gather(
+            live_server.serve_forever(),
+            playback_server.serve_forever())
 
 
 if __name__ == "__main__":

@@ -7,8 +7,10 @@ services:
       - mediamtx
     ports:
       - "10002:10002"
+      - "10003:10003"
     environment:
-      - JT1078_PORT=10002
+      - JT1078_LIVE_PORT=10002
+      - JT1078_PLAYBACK_PORT=10003
       - JT1078_CHANNEL_OFFSET=1
       - JT1078_VIDEO_CODEC=h264
 
