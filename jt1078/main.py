@@ -131,14 +131,25 @@ class Publisher:
         )
 
     async def write(self, frame: bytes):
-        if self.process is None:
-            await self.start()
-        if self.process.returncode is not None:
-            raise RuntimeError(f"FFmpeg exited with status {self.process.returncode}")
         if not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
             frame = b"\x00\x00\x00\x01" + frame
-        self.process.stdin.write(frame)
-        await self.process.stdin.drain()
+        for attempt in range(2):
+            if self.process is None or self.process.returncode is not None:
+                if self.process is not None:
+                    LOGGER.warning(
+                        "restarting publisher path=%s status=%s", self.path, self.process.returncode)
+                await self.start()
+            try:
+                self.process.stdin.write(frame)
+                await self.process.stdin.drain()
+                return
+            except (BrokenPipeError, ConnectionResetError):
+                await self.process.wait()
+                LOGGER.warning(
+                    "publisher connection closed path=%s status=%s", self.path, self.process.returncode)
+                self.process = None
+                if attempt:
+                    raise
 
     async def close(self):
         if self.process is None:
