@@ -109,15 +109,17 @@ class Publisher:
     async def start(self):
         target = f"rtsp://mediamtx:8554/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
-        LOGGER.info("starting publisher path=%s codec=%s", self.path, codec)
+        frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
+        LOGGER.info("starting publisher path=%s codec=%s frameRate=%s", self.path, codec, frame_rate)
         self.process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
             "-loglevel", os.getenv("FFMPEG_LOG_LEVEL", "warning"),
-            "-fflags", "nobuffer",
+            "-fflags", "+genpts+nobuffer",
             "-flags", "low_delay",
             "-analyzeduration", "1000000",
             "-probesize", "1000000",
+            "-r", frame_rate,
             "-f", codec,
             "-i", "pipe:0",
             "-an",
