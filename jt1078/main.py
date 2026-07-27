@@ -117,6 +117,7 @@ class Publisher:
             "-loglevel", os.getenv("FFMPEG_LOG_LEVEL", "warning"),
             "-fflags", "+genpts+nobuffer",
             "-flags", "low_delay",
+            "-use_wallclock_as_timestamps", "1",
             "-analyzeduration", "1000000",
             "-probesize", "1000000",
             "-r", frame_rate,
