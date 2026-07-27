@@ -1,4 +1,17 @@
 services:
+  jt1078:
+    build: ./jt1078
+    container_name: jt1078
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    ports:
+      - "10002:10002"
+    environment:
+      - JT1078_PORT=10002
+      - JT1078_CHANNEL_OFFSET=1
+      - JT1078_VIDEO_CODEC=h264
+
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
     container_name: mediamtx
