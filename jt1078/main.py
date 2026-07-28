@@ -182,7 +182,7 @@ class Connection:
         sequence_key = (packet.imei, packet.channel, packet.data_type)
         previous = self.last_sequences.get(sequence_key)
         if previous is not None and packet.sequence != (previous + 1) & 0xFFFF:
-            LOGGER.warning(
+            LOGGER.debug(
                 "sequence gap peer=%s imei=%s channel=%d dataType=%d expected=%d received=%d",
                 self.peer, packet.imei, packet.channel, packet.data_type,
                 (previous + 1) & 0xFFFF, packet.sequence)
