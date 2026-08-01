@@ -9,6 +9,7 @@ LOGGER = logging.getLogger("jt1078")
 
 MAGIC = b"\x30\x31\x63\x64"
 MAX_PAYLOAD_SIZE = 65535
+AAC_SAMPLE_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000)
 
 
 def audio_input_options(codec: str, sample_rate: str) -> list[str]:
@@ -16,6 +17,24 @@ def audio_input_options(codec: str, sample_rate: str) -> list[str]:
     if codec in {"alaw", "mulaw", "s16be", "s16le"}:
         options.extend(("-ar", sample_rate, "-ac", "1"))
     return options
+
+
+def prepare_audio_frame(frame: bytes, codec: str, sample_rate: str, channels: int = 1) -> bytes:
+    if codec != "aac" or frame.startswith((b"\xff\xf0", b"\xff\xf1", b"\xff\xf8", b"\xff\xf9")):
+        return frame
+    frequency_index = AAC_SAMPLE_RATES.index(int(sample_rate))
+    frame_length = len(frame) + 7
+    profile = 1  # AAC Low Complexity (Audio Object Type 2)
+    header = bytes((
+        0xFF,
+        0xF1,
+        (profile << 6) | (frequency_index << 2) | (channels >> 2),
+        ((channels & 3) << 6) | (frame_length >> 11),
+        (frame_length >> 3) & 0xFF,
+        ((frame_length & 7) << 5) | 0x1F,
+        0xFC,
+    ))
+    return header + frame
 
 
 def luhn(number: int) -> int:
@@ -116,6 +135,8 @@ class Publisher:
         self.process = None
         self.audio_input = None
         self.audio_payload_type = None
+        self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
+        self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
 
     async def start(self):
         if self.audio_input:
@@ -123,8 +144,8 @@ class Publisher:
             self.audio_input = None
         target = f"rtsp://mediamtx:8554/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
-        audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
-        audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
+        audio_codec = self.audio_codec
+        audio_sample_rate = self.audio_sample_rate
         audio_options = audio_input_options(audio_codec, audio_sample_rate)
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
         timestamp_step = round(90000 / float(frame_rate))
@@ -179,7 +200,8 @@ class Publisher:
                     if self.audio_payload_type != payload_type:
                         self.audio_payload_type = payload_type
                         LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
-                    self.audio_input.write(frame)
+                    self.audio_input.write(prepare_audio_frame(
+                        frame, self.audio_codec, self.audio_sample_rate))
                 else:
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()

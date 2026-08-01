@@ -1,6 +1,6 @@
 import unittest
 
-from main import MAGIC, PacketParser, audio_input_options, decode_terminal_id
+from main import MAGIC, PacketParser, audio_input_options, decode_terminal_id, prepare_audio_frame
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -23,6 +23,13 @@ class PacketParserTest(unittest.TestCase):
         self.assertEqual(
             ["-f", "alaw", "-ar", "8000", "-ac", "1"],
             audio_input_options("alaw", "8000"))
+
+    def test_prepare_audio_frame(self):
+        raw = b"\x21\x10\x04\x60"
+        framed = prepare_audio_frame(raw, "aac", "8000")
+        self.assertEqual(bytes.fromhex("fff16c40017ffc") + raw, framed)
+        self.assertIs(framed, prepare_audio_frame(framed, "aac", "8000"))
+        self.assertIs(raw, prepare_audio_frame(raw, "alaw", "8000"))
 
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
