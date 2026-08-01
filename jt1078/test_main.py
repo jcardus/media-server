@@ -3,9 +3,9 @@ import unittest
 from main import MAGIC, PacketParser, decode_terminal_id
 
 
-def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123):
+def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
     header = bytearray(MAGIC)
-    header.extend((0x80, 0xE0))
+    header.extend((0x80, 0x80 | payload_type))
     header.extend(sequence.to_bytes(2, "big"))
     header.extend(bytes.fromhex("4e3a0b712725"))
     header.append(channel)
@@ -30,7 +30,15 @@ class PacketParserTest(unittest.TestCase):
         self.assertEqual(1, len(packets))
         self.assertEqual("860112070346616", packets[0].imei)
         self.assertEqual(1, packets[0].channel)
+        self.assertEqual(96, packets[0].payload_type)
         self.assertEqual(b"\x00\x00\x00\x01\x67\x64", packets[0].payload)
+
+    def test_audio_packet(self):
+        packets = PacketParser().feed(packet(b"audio", data_type=3, payload_type=6))
+        self.assertEqual(1, len(packets))
+        self.assertEqual(3, packets[0].data_type)
+        self.assertEqual(6, packets[0].payload_type)
+        self.assertEqual(b"audio", packets[0].payload)
 
     def test_multiple_packets(self):
         parser = PacketParser()

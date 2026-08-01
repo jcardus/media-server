@@ -36,6 +36,7 @@ class Packet:
     sequence: int
     imei: str
     channel: int
+    payload_type: int
     data_type: int
     fragment_type: int
     timestamp: int
@@ -90,6 +91,7 @@ class PacketParser:
                 sequence=int.from_bytes(self.buffer[6:8], "big"),
                 imei=decode_terminal_id(bytes(self.buffer[8:14])),
                 channel=self.buffer[14],
+                payload_type=self.buffer[5] & 0x7F,
                 data_type=data_type,
                 fragment_type=fragment_type,
                 timestamp=timestamp,
@@ -105,17 +107,28 @@ class Publisher:
         output_channel = max(0, channel - channel_offset)
         self.path = f"{namespace}/{output_channel}/{imei}"
         self.process = None
+        self.audio_input = None
+        self.audio_payload_type = None
 
     async def start(self):
+        if self.audio_input:
+            self.audio_input.close()
+            self.audio_input = None
         target = f"rtsp://mediamtx:8554/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
+        audio_codec = os.getenv("JT1078_AUDIO_CODEC", "alaw")
+        audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
         timestamp_step = round(90000 / float(frame_rate))
         timestamp_filter = (
             f"setts=pts=N*{timestamp_step}:dts=N*{timestamp_step}:"
             f"duration={timestamp_step}:time_base=1/90000"
         )
-        LOGGER.info("starting publisher path=%s codec=%s frameRate=%s", self.path, codec, frame_rate)
+        audio_read, audio_write = os.pipe()
+        self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
+        LOGGER.info(
+            "starting publisher path=%s videoCodec=%s frameRate=%s audioCodec=%s audioRate=%s",
+            self.path, codec, frame_rate, audio_codec, audio_sample_rate)
         self.process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
@@ -126,17 +139,27 @@ class Publisher:
             "-probesize", "1000000",
             "-f", codec,
             "-i", "pipe:0",
-            "-an",
+            "-thread_queue_size", "512",
+            "-f", audio_codec,
+            "-ar", audio_sample_rate,
+            "-ac", "1",
+            "-i", f"pipe:{audio_read}",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
             "-c:v", "copy",
+            "-c:a", "copy",
             "-bsf:v", timestamp_filter,
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
             stdin=asyncio.subprocess.PIPE,
+            pass_fds=(audio_read,),
         )
+        os.close(audio_read)
 
-    async def write(self, frame: bytes):
-        if not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
+    async def write(self, frame: bytes, data_type: int, payload_type: int):
+        is_audio = data_type == 3
+        if not is_audio and not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
             frame = b"\x00\x00\x00\x01" + frame
         for attempt in range(2):
             if self.process is None or self.process.returncode is not None:
@@ -145,10 +168,16 @@ class Publisher:
                         "restarting publisher path=%s status=%s", self.path, self.process.returncode)
                 await self.start()
             try:
-                self.process.stdin.write(frame)
-                await self.process.stdin.drain()
+                if is_audio:
+                    if self.audio_payload_type != payload_type:
+                        self.audio_payload_type = payload_type
+                        LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
+                    self.audio_input.write(frame)
+                else:
+                    self.process.stdin.write(frame)
+                    await self.process.stdin.drain()
                 return
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ValueError):
                 await self.process.wait()
                 LOGGER.warning(
                     "publisher connection closed path=%s status=%s", self.path, self.process.returncode)
@@ -159,6 +188,9 @@ class Publisher:
     async def close(self):
         if self.process is None:
             return
+        if self.audio_input:
+            self.audio_input.close()
+            self.audio_input = None
         if self.process.stdin:
             self.process.stdin.close()
         try:
@@ -188,9 +220,6 @@ class Connection:
                 (previous + 1) & 0xFFFF, packet.sequence)
         self.last_sequences[sequence_key] = packet.sequence
 
-        if packet.data_type == 3:
-            return  # Audio is intentionally omitted; browsers receive video-only WebRTC.
-
         fragment_key = (packet.imei, packet.channel, packet.timestamp, packet.data_type)
         if packet.fragment_type == 0:
             frame = packet.payload
@@ -212,7 +241,7 @@ class Connection:
         if publisher is None:
             publisher = Publisher(*key, self.namespace)
             self.publishers[key] = publisher
-        await publisher.write(frame)
+        await publisher.write(frame, packet.data_type, packet.payload_type)
 
     async def close(self):
         await asyncio.gather(*(publisher.close() for publisher in self.publishers.values()), return_exceptions=True)
