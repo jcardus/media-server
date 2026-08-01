@@ -116,7 +116,7 @@ class Publisher:
             self.audio_input = None
         target = f"rtsp://mediamtx:8554/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
-        audio_codec = os.getenv("JT1078_AUDIO_CODEC", "alaw")
+        audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
         audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
         timestamp_step = round(90000 / float(frame_rate))
