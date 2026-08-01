@@ -1,6 +1,6 @@
 import unittest
 
-from main import MAGIC, PacketParser, decode_terminal_id
+from main import MAGIC, PacketParser, audio_input_options, decode_terminal_id
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -18,6 +18,12 @@ def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timesta
 
 
 class PacketParserTest(unittest.TestCase):
+    def test_audio_input_options(self):
+        self.assertEqual(["-f", "aac"], audio_input_options("aac", "8000"))
+        self.assertEqual(
+            ["-f", "alaw", "-ar", "8000", "-ac", "1"],
+            audio_input_options("alaw", "8000"))
+
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
         self.assertEqual("013345678906", decode_terminal_id(bytes.fromhex("013345678906")))

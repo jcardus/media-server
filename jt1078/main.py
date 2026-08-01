@@ -11,6 +11,13 @@ MAGIC = b"\x30\x31\x63\x64"
 MAX_PAYLOAD_SIZE = 65535
 
 
+def audio_input_options(codec: str, sample_rate: str) -> list[str]:
+    options = ["-f", codec]
+    if codec in {"alaw", "mulaw", "s16be", "s16le"}:
+        options.extend(("-ar", sample_rate, "-ac", "1"))
+    return options
+
+
 def luhn(number: int) -> int:
     total = 0
     for index, value in enumerate(reversed(str(number))):
@@ -118,6 +125,7 @@ class Publisher:
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
         audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
         audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
+        audio_options = audio_input_options(audio_codec, audio_sample_rate)
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
         timestamp_step = round(90000 / float(frame_rate))
         timestamp_filter = (
@@ -140,9 +148,7 @@ class Publisher:
             "-f", codec,
             "-i", "pipe:0",
             "-thread_queue_size", "512",
-            "-f", audio_codec,
-            "-ar", audio_sample_rate,
-            "-ac", "1",
+            *audio_options,
             "-i", f"pipe:{audio_read}",
             "-map", "0:v:0",
             "-map", "1:a:0",
