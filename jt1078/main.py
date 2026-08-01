@@ -142,7 +142,7 @@ class Publisher:
         if self.audio_input:
             self.audio_input.close()
             self.audio_input = None
-        target = f"rtsp://mediamtx:8554/{self.path}"
+        target = f"rtsp://mediamtx:8554/rtc/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
         audio_codec = self.audio_codec
         audio_sample_rate = self.audio_sample_rate
@@ -156,7 +156,7 @@ class Publisher:
         audio_read, audio_write = os.pipe()
         self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
         LOGGER.info(
-            "starting publisher path=%s videoCodec=%s frameRate=%s audioCodec=%s audioRate=%s",
+            "starting publisher path=rtc/%s videoCodec=%s frameRate=%s audioCodec=%s audioRate=%s",
             self.path, codec, frame_rate, audio_codec, audio_sample_rate)
         self.process = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -174,8 +174,9 @@ class Publisher:
             "-map", "0:v:0",
             "-map", "1:a:0",
             "-c:v", "copy",
-            "-c:a", "aac",
+            "-c:a", "libopus",
             "-b:a", "32k",
+            "-af", "aresample=async=1000",
             "-bsf:v", timestamp_filter,
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
