@@ -16,6 +16,7 @@ services:
       # JT/T 1078 payload type 19 reported by the camera is AAC.
       - JT1078_AUDIO_CODEC=aac
       - JT1078_AUDIO_SAMPLE_RATE=8000
+      - FFMPEG_LOG_LEVEL=debug
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
