@@ -137,6 +137,10 @@ class Publisher:
         self.audio_payload_type = None
         self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
         self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
+        # Channels that never send audio must not block video: FFmpeg blocks
+        # opening a second -i until it can probe it, so the audio input is
+        # only added once we have actually observed an audio packet.
+        self.has_audio = False
 
     async def start(self):
         if self.audio_input:
@@ -150,10 +154,7 @@ class Publisher:
             f"setts=pts=N*{timestamp_step}:dts=N*{timestamp_step}:"
             f"duration={timestamp_step}:time_base=1/90000"
         )
-        LOGGER.info(
-            "starting video-only publisher path=rtc/%s videoCodec=%s frameRate=%s",
-            self.path, codec, frame_rate)
-        self.process = await asyncio.create_subprocess_exec(
+        args = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", os.getenv("FFMPEG_LOG_LEVEL", "warning"),
@@ -163,19 +164,53 @@ class Publisher:
             "-probesize", "1000000",
             "-f", codec,
             "-i", "pipe:0",
-            "-an",
-            "-c:v", "copy",
+        ]
+        pass_fds = ()
+        audio_read = None
+        if self.has_audio:
+            audio_options = audio_input_options(self.audio_codec, self.audio_sample_rate)
+            audio_read, audio_write = os.pipe()
+            self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
+            args += [
+                "-thread_queue_size", "512",
+                *audio_options,
+                "-i", f"pipe:{audio_read}",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "libopus",
+                "-b:a", "32k",
+                "-af", "aresample=async=1000",
+            ]
+            pass_fds = (audio_read,)
+        else:
+            args += ["-an", "-c:v", "copy"]
+        args += [
             "-bsf:v", timestamp_filter,
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
+        ]
+        LOGGER.info(
+            "starting publisher path=rtc/%s videoCodec=%s frameRate=%s audio=%s",
+            self.path, codec, frame_rate, self.has_audio)
+        self.process = await asyncio.create_subprocess_exec(
+            *args,
             stdin=asyncio.subprocess.PIPE,
+            pass_fds=pass_fds,
         )
+        if audio_read is not None:
+            os.close(audio_read)
 
     async def write(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
         if not is_audio and not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
             frame = b"\x00\x00\x00\x01" + frame
+        if is_audio and not self.has_audio:
+            self.has_audio = True
+            if self.process is not None and self.process.returncode is None:
+                LOGGER.info("audio detected, restarting publisher path=%s", self.path)
+                await self.close()
         for attempt in range(2):
             if self.process is None or self.process.returncode is not None:
                 if self.process is not None:
@@ -235,9 +270,6 @@ class Connection:
                 self.peer, packet.imei, packet.channel, packet.data_type,
                 (previous + 1) & 0xFFFF, packet.sequence)
         self.last_sequences[sequence_key] = packet.sequence
-
-        if packet.data_type == 3:
-            return
 
         fragment_key = (packet.imei, packet.channel, packet.timestamp, packet.data_type)
         if packet.fragment_type == 0:

@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
-from main import MAGIC, PacketParser, audio_input_options, decode_terminal_id, prepare_audio_frame
+from main import MAGIC, PacketParser, Publisher, audio_input_options, decode_terminal_id, prepare_audio_frame
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -57,6 +58,29 @@ class PacketParserTest(unittest.TestCase):
         parser = PacketParser()
         packets = parser.feed(packet(b"a", sequence=1) + packet(b"b", sequence=2))
         self.assertEqual([b"a", b"b"], [value.payload for value in packets])
+
+
+class PublisherTest(unittest.IsolatedAsyncioTestCase):
+    async def test_starts_video_only_without_blocking_on_audio(self):
+        publisher = Publisher("860112070346616", 1, "live")
+        with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
+            await publisher.start()
+        args = create.call_args.args
+        self.assertIn("-an", args)
+        self.assertEqual((), create.call_args.kwargs["pass_fds"])
+        self.assertIsNone(publisher.audio_input)
+
+    async def test_adds_audio_input_once_audio_is_detected(self):
+        publisher = Publisher("860112070346616", 1, "live")
+        with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
+            publisher.has_audio = True
+            await publisher.start()
+        args = create.call_args.args
+        self.assertNotIn("-an", args)
+        self.assertIn("-c:a", args)
+        self.assertNotEqual((), create.call_args.kwargs["pass_fds"])
+        self.assertIsNotNone(publisher.audio_input)
+        publisher.audio_input.close()
 
 
 if __name__ == "__main__":
