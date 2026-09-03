@@ -173,5 +173,22 @@ class ConnectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(main.ACTIVE_PUBLISHERS[("live", "860112070346616", 1)], second_publisher)
 
 
+class HandleConnectionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_closes_connection_after_idle_timeout(self):
+        # A camera on a cellular/NAT network can drop a connection
+        # without ever sending a FIN/RST, leaving reader.read() blocked
+        # forever unless it is bounded by a timeout.
+        reader = AsyncMock()
+        reader.read = AsyncMock(side_effect=lambda size: asyncio.sleep(3600))
+        writer = MagicMock()
+        writer.get_extra_info.return_value = ("1.2.3.4", 1)
+        writer.wait_closed = AsyncMock()
+
+        with patch.dict("os.environ", {"JT1078_READ_TIMEOUT": "0.01"}):
+            await asyncio.wait_for(main.handle_connection(reader, writer, "live"), timeout=2)
+
+        writer.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

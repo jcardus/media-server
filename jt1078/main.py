@@ -393,10 +393,19 @@ async def handle_connection(
     peer = writer.get_extra_info("peername")
     connection = Connection(peer, namespace)
     LOGGER.info("camera connected peer=%s namespace=%s", peer, namespace)
+    # Cameras on cellular/NAT networks can drop a connection without ever
+    # sending a FIN/RST. Without a read timeout, reader.read() would then
+    # block forever, leaking this connection's publisher (and the ffmpeg
+    # process it owns) until the process is restarted -- observed in
+    # production as a stream going dead mid-session with jt1078 never
+    # logging anything about it again.
+    read_timeout = float(os.getenv("JT1078_READ_TIMEOUT", "30"))
     try:
-        while data := await reader.read(65536):
+        while data := await asyncio.wait_for(reader.read(65536), timeout=read_timeout):
             for packet in connection.parser.feed(data):
                 await connection.process(packet)
+    except asyncio.TimeoutError:
+        LOGGER.warning("camera idle timeout peer=%s namespace=%s", peer, namespace)
     except (ConnectionError, asyncio.IncompleteReadError):
         pass
     except Exception:
