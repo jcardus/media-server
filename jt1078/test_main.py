@@ -2,7 +2,9 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from main import MAGIC, PacketParser, Publisher, audio_input_options, decode_terminal_id, prepare_audio_frame
+import main
+from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_input_options, decode_terminal_id, \
+    prepare_audio_frame
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -136,6 +138,34 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(publisher.decided)
         self.assertFalse(publisher.has_audio)
         process.stdin.write.assert_called_once_with(b"\x00\x00\x00\x01video")
+
+
+def make_packet(imei="860112070346616", channel=1, payload=b"\x00\x00\x00\x01video") -> Packet:
+    return Packet(
+        sequence=1, imei=imei, channel=channel, payload_type=96,
+        data_type=0, fragment_type=0, timestamp=123, payload=payload)
+
+
+class ConnectionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_replaces_stale_publisher_from_a_dropped_connection(self):
+        # A camera that reconnects without the OS ever closing its old
+        # TCP socket (dropped silently by a NAT/firewall) leaves the old
+        # Connection's publisher running forever unless the new
+        # connection evicts it.
+        main.ACTIVE_PUBLISHERS.clear()
+        with patch.object(Publisher, "close", new=AsyncMock()) as close:
+            first = Connection(("1.2.3.4", 1), "live")
+            await first.process(make_packet())
+            first_publisher = first.publishers[("860112070346616", 1)]
+
+            second = Connection(("1.2.3.4", 2), "live")
+            await second.process(make_packet())
+            second_publisher = second.publishers[("860112070346616", 1)]
+            await asyncio.sleep(0)
+
+        close.assert_called_once()
+        self.assertIsNot(first_publisher, second_publisher)
+        self.assertIs(main.ACTIVE_PUBLISHERS[("live", "860112070346616", 1)], second_publisher)
 
 
 if __name__ == "__main__":

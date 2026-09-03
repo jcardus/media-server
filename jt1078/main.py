@@ -181,12 +181,17 @@ class Publisher:
             self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
             args += [
                 "-thread_queue_size", "512",
-                # Low-bitrate voice audio can take minutes to reach FFmpeg's
-                # default 5,000,000-byte probesize, stalling this input open
-                # indefinitely (and with it the whole muxer, video included).
-                # One ADTS frame is enough to know the stream parameters.
-                "-analyzeduration", "500000",
-                "-probesize", "32768",
+                # Sparse/gappy voice audio (silence gaps, VAD-gated
+                # transmission) can take minutes of wall-clock time to
+                # reach even a modest probesize, stalling this input open
+                # indefinitely (and with it the whole muxer, video
+                # included) -- confirmed in production: one connection
+                # took 8 minutes to satisfy a 32768-byte probesize. The
+                # format is already known (-f aac) and one ADTS frame is
+                # enough to learn the stream parameters, so keep both
+                # bounds as small as FFmpeg allows.
+                "-analyzeduration", "100000",
+                "-probesize", "4096",
                 *audio_options,
                 "-i", f"pipe:{audio_read}",
                 "-map", "0:v:0",
@@ -302,6 +307,18 @@ class Publisher:
             await self.process.wait()
 
 
+# Tracks the currently-active Publisher per (namespace, imei, channel),
+# across all connections. A camera that reconnects without cleanly
+# closing its old TCP connection (dropped by a NAT/firewall without a
+# FIN/RST) leaves the old handle_connection() coroutine stuck forever in
+# reader.read(), so its Connection.close() cleanup never runs and its
+# publisher -- and the ffmpeg process it owns -- leaks, silently
+# competing with the new connection for the same MediaMTX path. This
+# registry lets a new connection evict that stale publisher immediately
+# instead of waiting on a TCP-level cleanup that may never come.
+ACTIVE_PUBLISHERS = {}
+
+
 class Connection:
     def __init__(self, peer, namespace: str):
         self.peer = peer
@@ -341,11 +358,21 @@ class Connection:
 
         publisher = self.publishers.get(key)
         if publisher is None:
+            registry_key = (self.namespace, *key)
+            stale = ACTIVE_PUBLISHERS.get(registry_key)
+            if stale is not None:
+                LOGGER.warning("replacing stale publisher path=%s", stale.path)
+                asyncio.ensure_future(stale.close())
             publisher = Publisher(*key, self.namespace)
             self.publishers[key] = publisher
+            ACTIVE_PUBLISHERS[registry_key] = publisher
         await publisher.write(frame, packet.data_type, packet.payload_type)
 
     async def close(self):
+        for key, publisher in self.publishers.items():
+            registry_key = (self.namespace, *key)
+            if ACTIVE_PUBLISHERS.get(registry_key) is publisher:
+                del ACTIVE_PUBLISHERS[registry_key]
         await asyncio.gather(*(publisher.close() for publisher in self.publishers.values()), return_exceptions=True)
 
 
