@@ -122,6 +122,49 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         publisher.audio_input.write.assert_called_once()
         self.assertEqual([], publisher.pending)
 
+    async def test_restarts_publisher_when_audio_write_stalls(self):
+        # If FFmpeg's audio pipeline wedges mid-stream, drain() must not
+        # be allowed to hang forever -- that would silently freeze this
+        # connection's entire packet loop with no error and no recovery.
+        publisher = Publisher("860112070346616", 1, "live")
+        publisher.decided = True
+        publisher.has_audio = True
+
+        stalled_process = MagicMock()
+        stalled_process.returncode = None
+        stalled_process.terminate = MagicMock()
+        stalled_process.wait = AsyncMock(return_value=None)
+
+        async def hang():
+            await asyncio.sleep(3600)
+
+        stalled_audio_input = MagicMock()
+        stalled_audio_input.drain = AsyncMock(side_effect=hang)
+
+        healthy_process = MagicMock()
+        healthy_process.returncode = None
+        healthy_audio_input = MagicMock()
+        healthy_audio_input.drain = AsyncMock()
+
+        starts = []
+
+        async def fake_start():
+            if not starts:
+                starts.append(stalled_process)
+                publisher.process = stalled_process
+                publisher.audio_input = stalled_audio_input
+            else:
+                publisher.process = healthy_process
+                publisher.audio_input = healthy_audio_input
+
+        with patch.dict("os.environ", {"JT1078_AUDIO_WRITE_TIMEOUT": "0.01"}):
+            with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)):
+                await publisher.write(b"audio", data_type=3, payload_type=19)
+
+        stalled_process.terminate.assert_called_once()
+        self.assertIs(publisher.process, healthy_process)
+        healthy_audio_input.write.assert_called_once()
+
     async def test_commits_video_only_after_grace_period(self):
         publisher = Publisher("860112070346616", 1, "live")
         process = MagicMock()
@@ -177,8 +220,11 @@ class HandleConnectionTest(unittest.IsolatedAsyncioTestCase):
         # A camera on a cellular/NAT network can drop a connection
         # without ever sending a FIN/RST, leaving reader.read() blocked
         # forever unless it is bounded by a timeout.
+        async def hang(size):
+            await asyncio.sleep(3600)
+
         reader = AsyncMock()
-        reader.read = AsyncMock(side_effect=lambda size: asyncio.sleep(3600))
+        reader.read = AsyncMock(side_effect=hang)
         writer = MagicMock()
         writer.get_extra_info.return_value = ("1.2.3.4", 1)
         writer.wait_closed = AsyncMock()

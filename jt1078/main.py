@@ -287,11 +287,32 @@ class Publisher:
                         LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
                     self.audio_input.write(prepare_audio_frame(
                         frame, self.audio_codec, self.audio_sample_rate))
-                    await self.audio_input.drain()
+                    # If FFmpeg's audio pipeline ever stalls mid-stream
+                    # (the same class of internal wedge seen during
+                    # startup probing, just happening later), drain()
+                    # would otherwise wait forever for backpressure that
+                    # will never clear -- silently hanging this
+                    # connection's entire packet loop with no error and
+                    # no way to recover. Bound it so a stall becomes a
+                    # detected, recoverable failure instead.
+                    await asyncio.wait_for(
+                        self.audio_input.drain(),
+                        timeout=float(os.getenv("JT1078_AUDIO_WRITE_TIMEOUT", "2")))
                 else:
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()
                 return
+            except asyncio.TimeoutError:
+                LOGGER.warning("publisher audio write stalled, restarting path=%s", self.path)
+                self.process.terminate()
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    self.process.kill()
+                    await self.process.wait()
+                self.process = None
+                if attempt:
+                    raise
             except (BrokenPipeError, ConnectionResetError, ValueError):
                 await self.process.wait()
                 LOGGER.warning(

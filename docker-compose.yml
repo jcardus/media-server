@@ -17,7 +17,6 @@ services:
       - JT1078_AUDIO_CODEC=aac
       - JT1078_AUDIO_SAMPLE_RATE=8000
       - FFMPEG_LOG_LEVEL=verbose
-      - JT1078_READ_TIMEOUT=300
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
