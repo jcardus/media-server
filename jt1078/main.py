@@ -175,10 +175,10 @@ class Publisher:
         ]
         pass_fds = ()
         audio_read = None
+        audio_write = None
         if self.has_audio:
             audio_options = audio_input_options(self.audio_codec, self.audio_sample_rate)
             audio_read, audio_write = os.pipe()
-            self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
             args += [
                 "-thread_queue_size", "512",
                 # Sparse/gappy voice audio (silence gaps, VAD-gated
@@ -220,6 +220,17 @@ class Publisher:
         )
         if audio_read is not None:
             os.close(audio_read)
+            # A plain blocking write() to this pipe (as used to be done
+            # here) can freeze the entire event loop -- all cameras, not
+            # just this one -- if ffmpeg's audio reader ever stalls (e.g.
+            # backpressure from the RTSP connection to MediaMTX) long
+            # enough to fill the kernel pipe buffer. Route writes through
+            # asyncio instead so a stalled reader just backs up this
+            # publisher's writes rather than blocking the whole process.
+            loop = asyncio.get_event_loop()
+            transport, protocol = await loop.connect_write_pipe(
+                asyncio.streams.FlowControlMixin, os.fdopen(audio_write, "wb", buffering=0))
+            self.audio_input = asyncio.StreamWriter(transport, protocol, None, loop)
 
     async def write(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
@@ -276,6 +287,7 @@ class Publisher:
                         LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
                     self.audio_input.write(prepare_audio_frame(
                         frame, self.audio_codec, self.audio_sample_rate))
+                    await self.audio_input.drain()
                 else:
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()

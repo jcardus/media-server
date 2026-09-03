@@ -99,9 +99,14 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         process.stdin = MagicMock()
         process.stdin.drain = AsyncMock()
 
+        def make_audio_input():
+            audio_input = MagicMock()
+            audio_input.drain = AsyncMock()
+            return audio_input
+
         async def fake_start():
             publisher.process = process
-            publisher.audio_input = MagicMock() if publisher.has_audio else None
+            publisher.audio_input = make_audio_input() if publisher.has_audio else None
 
         with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)) as start:
             await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=96)
