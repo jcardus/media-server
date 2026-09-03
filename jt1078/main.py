@@ -213,7 +213,15 @@ class Publisher:
                 "-c:v", "copy",
                 "-c:a", "libopus",
                 "-b:a", "32k",
-                "-af", "aresample=async=1000",
+                # No resampling needed or wanted here: the audio is
+                # already 8kHz, one of libopus's native input rates.
+                # aresample's "async" drift correction (carried over
+                # from mediamtx.yml's separate transcode step, a
+                # different context with a real RTSP source and
+                # reliable timestamps) was observed discarding nearly
+                # an entire AAC frame's worth of samples repeatedly
+                # against our self-generated timing, immediately before
+                # every mid-stream stall seen in production.
             ]
             pass_fds = (audio_read,)
         else:
