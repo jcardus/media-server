@@ -181,6 +181,12 @@ class Publisher:
             self.audio_input = os.fdopen(audio_write, "wb", buffering=0)
             args += [
                 "-thread_queue_size", "512",
+                # Low-bitrate voice audio can take minutes to reach FFmpeg's
+                # default 5,000,000-byte probesize, stalling this input open
+                # indefinitely (and with it the whole muxer, video included).
+                # One ADTS frame is enough to know the stream parameters.
+                "-analyzeduration", "500000",
+                "-probesize", "32768",
                 *audio_options,
                 "-i", f"pipe:{audio_read}",
                 "-map", "0:v:0",

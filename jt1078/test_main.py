@@ -81,6 +81,13 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-c:a", args)
         self.assertNotEqual((), create.call_args.kwargs["pass_fds"])
         self.assertIsNotNone(publisher.audio_input)
+        # The audio input must not rely on FFmpeg's default probesize
+        # (5MB), which low-bitrate voice audio could take minutes to
+        # reach, stalling the whole publisher.
+        video_input_index = args.index("pipe:0")
+        audio_input_index = args.index("-i", video_input_index + 1)
+        probesize_index = args.index("-probesize", video_input_index, audio_input_index)
+        self.assertLess(int(args[probesize_index + 1]), 1_000_000)
         publisher.audio_input.close()
 
     async def test_buffers_video_until_audio_arrives_then_commits_once(self):
