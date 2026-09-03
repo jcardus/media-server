@@ -144,15 +144,17 @@ class Publisher:
             self.audio_input = None
         target = f"rtsp://mediamtx:8554/rtc/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
+        audio_options = audio_input_options(self.audio_codec, self.audio_sample_rate)
         frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
         timestamp_step = round(90000 / float(frame_rate))
         timestamp_filter = (
             f"setts=pts=N*{timestamp_step}:dts=N*{timestamp_step}:"
             f"duration={timestamp_step}:time_base=1/90000"
         )
+        audio_read, audio_write = os.pipe()
         LOGGER.info(
-            "starting video-only publisher path=rtc/%s videoCodec=%s frameRate=%s",
-            self.path, codec, frame_rate)
+            "starting publisher path=rtc/%s videoCodec=%s frameRate=%s audioCodec=%s audioRate=%s",
+            self.path, codec, frame_rate, self.audio_codec, self.audio_sample_rate)
         self.process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
@@ -163,14 +165,27 @@ class Publisher:
             "-probesize", "1000000",
             "-f", codec,
             "-i", "pipe:0",
-            "-an",
+            "-thread_queue_size", "512",
+            *audio_options,
+            "-i", f"pipe:{audio_read}",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
             "-c:v", "copy",
+            "-c:a", "libopus",
+            "-b:a", "32k",
+            "-af", "aresample=async=1000",
             "-bsf:v", timestamp_filter,
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
             stdin=asyncio.subprocess.PIPE,
+            pass_fds=(audio_read,),
         )
+        os.close(audio_read)
+        loop = asyncio.get_event_loop()
+        transport, protocol = await loop.connect_write_pipe(
+            asyncio.streams.FlowControlMixin, os.fdopen(audio_write, "wb", buffering=0))
+        self.audio_input = asyncio.StreamWriter(transport, protocol, None, loop)
 
     async def write(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
@@ -189,6 +204,7 @@ class Publisher:
                         LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
                     self.audio_input.write(prepare_audio_frame(
                         frame, self.audio_codec, self.audio_sample_rate))
+                    await self.audio_input.drain()
                 else:
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()
@@ -235,9 +251,6 @@ class Connection:
                 self.peer, packet.imei, packet.channel, packet.data_type,
                 (previous + 1) & 0xFFFF, packet.sequence)
         self.last_sequences[sequence_key] = packet.sequence
-
-        if packet.data_type == 3:
-            return
 
         fragment_key = (packet.imei, packet.channel, packet.timestamp, packet.data_type)
         if packet.fragment_type == 0:
