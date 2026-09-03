@@ -220,6 +220,19 @@ class Publisher:
             args += ["-an", "-c:v", "copy"]
         args += [
             "-bsf:v", timestamp_filter,
+        ]
+        if self.has_audio:
+            # The RTSP muxer interleaves packets from both streams in
+            # timestamp order by default, buffering whichever stream is
+            # "ahead" until the other catches up. With H.264 video at
+            # ~1.2Mbps against ~32kbps Opus audio -- and neither stream
+            # on a clock that exactly matches the camera's real delivery
+            # rate -- that wait can grow unbounded and never resolve.
+            # Disable strict interleaving so the muxer writes packets as
+            # they arrive instead of holding one stream hostage to the
+            # other.
+            args += ["-max_interleave_delta", "0"]
+        args += [
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
