@@ -192,20 +192,6 @@ class Publisher:
                 # bounds as small as FFmpeg allows.
                 "-analyzeduration", "100000",
                 "-probesize", "4096",
-                # Video runs on a synthetic, frame-count-based clock (see
-                # the setts bitstream filter below) with no relation to
-                # real elapsed time; left alone, audio's own AAC-sample-
-                # count-based clock has no shared reference with it. Any
-                # mismatch between each clock's assumed rate and the
-                # camera's actual delivery rate accumulates until the
-                # two streams' timelines have drifted apart enough that
-                # the RTSP muxer -- which interleaves packets from both
-                # streams in timestamp order -- stalls waiting for one
-                # side to "catch up" (observed in production: a rock-
-                # solid ~20s into every audio-enabled stream). Anchor
-                # audio to real wall-clock time so it can't drift
-                # indefinitely away from video's roughly-real-time pace.
-                "-use_wallclock_as_timestamps", "1",
                 *audio_options,
                 "-i", f"pipe:{audio_read}",
                 "-map", "0:v:0",
@@ -213,15 +199,13 @@ class Publisher:
                 "-c:v", "copy",
                 "-c:a", "libopus",
                 "-b:a", "32k",
-                # No resampling needed or wanted here: the audio is
-                # already 8kHz, one of libopus's native input rates.
-                # aresample's "async" drift correction (carried over
-                # from mediamtx.yml's separate transcode step, a
-                # different context with a real RTSP source and
-                # reliable timestamps) was observed discarding nearly
-                # an entire AAC frame's worth of samples repeatedly
-                # against our self-generated timing, immediately before
-                # every mid-stream stall seen in production.
+                # No resampling needed here: the audio is already 8kHz,
+                # one of libopus's native input rates. aresample's
+                # "async" drift correction (carried over from
+                # mediamtx.yml's separate transcode step, a different
+                # context with a real RTSP source) was masking, not
+                # fixing, a real timestamp bug -- see the git history
+                # for -use_wallclock_as_timestamps on this input.
             ]
             pass_fds = (audio_read,)
         else:
