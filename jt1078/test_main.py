@@ -92,6 +92,21 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(int(args[probesize_index + 1]), 1_000_000)
         publisher.audio_input.close()
 
+    async def test_video_input_is_wallclock_timestamped_not_synthetic(self):
+        # Video carries no timestamps of its own; a synthetic frame-counter
+        # clock drifts against audio until the RTSP muxer starves. Stamp it
+        # from the wall clock so both streams share a real-time pace.
+        publisher = Publisher("860112070346616", 1, "live")
+        publisher.has_audio = True
+        with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
+            await publisher.start()
+        args = create.call_args.args
+        wallclock_index = args.index("-use_wallclock_as_timestamps")
+        self.assertLess(wallclock_index, args.index("pipe:0"))
+        self.assertNotIn("-bsf:v", args)
+        self.assertFalse(any("setts" in str(a) for a in args))
+        publisher.audio_input.close()
+
     async def test_buffers_video_until_audio_arrives_then_commits_once(self):
         publisher = Publisher("860112070346616", 1, "live")
         process = MagicMock()
@@ -213,6 +228,52 @@ class ConnectionTest(unittest.IsolatedAsyncioTestCase):
         close.assert_called_once()
         self.assertIsNot(first_publisher, second_publisher)
         self.assertIs(main.ACTIVE_PUBLISHERS[("live", "860112070346616", 1)], second_publisher)
+
+
+class PublisherStatusTest(unittest.TestCase):
+    def setUp(self):
+        main.ACTIVE_PUBLISHERS.clear()
+        self.addCleanup(main.ACTIVE_PUBLISHERS.clear)
+
+    def test_reports_not_connected_when_no_publisher(self):
+        status = main.publisher_status("live", "860112070346616", "0")
+        self.assertEqual(status["connected"], False)
+        self.assertEqual(status["publishing"], False)
+        self.assertIsNone(status["videoAgeMs"])
+
+    def test_reports_liveness_for_an_active_publisher(self):
+        publisher = Publisher("860112070346616", 1, "live")  # channel 1 -> output 0
+        process = MagicMock()
+        process.returncode = None
+        publisher.process = process
+        publisher.decided = True
+        publisher.has_audio = True
+        publisher.started_at = main.time.monotonic() - 4.0
+        publisher.last_video_at = main.time.monotonic()
+        publisher.last_audio_at = main.time.monotonic()
+        main.ACTIVE_PUBLISHERS[("live", "860112070346616", 1)] = publisher
+
+        status = main.publisher_status("live", "860112070346616", "0")
+        self.assertEqual(status["connected"], True)
+        self.assertEqual(status["publishing"], True)
+        self.assertEqual(status["hasVideo"], True)
+        self.assertEqual(status["hasAudio"], True)
+        self.assertLess(status["videoAgeMs"], 1000)
+        self.assertGreaterEqual(status["uptimeMs"], 4000)
+
+        # A different channel on the same camera has no publisher.
+        self.assertEqual(
+            main.publisher_status("live", "860112070346616", "1")["connected"], False)
+
+    def test_publishing_false_once_ffmpeg_exits(self):
+        publisher = Publisher("860112070346616", 1, "live")
+        process = MagicMock()
+        process.returncode = 0
+        publisher.process = process
+        main.ACTIVE_PUBLISHERS[("live", "860112070346616", 1)] = publisher
+        status = main.publisher_status("live", "860112070346616", "0")
+        self.assertEqual(status["connected"], True)
+        self.assertEqual(status["publishing"], False)
 
 
 class HandleConnectionTest(unittest.IsolatedAsyncioTestCase):

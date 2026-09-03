@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 
 
@@ -149,19 +151,24 @@ class Publisher:
         self.pending = []
         self.grace_handle = None
         self.grace_task = None
+        # Liveness telemetry for the /status endpoint: monotonic timestamps
+        # of the last frame received from the camera, when ffmpeg was last
+        # (re)started, and how many times it has been restarted.
+        self.created_at = time.monotonic()
+        self.started_at = None
+        self.last_video_at = None
+        self.last_audio_at = None
+        self.restart_count = 0
 
     async def start(self):
+        if self.started_at is not None:
+            self.restart_count += 1
+        self.started_at = time.monotonic()
         if self.audio_input:
             self.audio_input.close()
             self.audio_input = None
         target = f"rtsp://mediamtx:8554/rtc/{self.path}"
         codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
-        frame_rate = os.getenv("JT1078_VIDEO_FRAME_RATE", "25")
-        timestamp_step = round(90000 / float(frame_rate))
-        timestamp_filter = (
-            f"setts=pts=N*{timestamp_step}:dts=N*{timestamp_step}:"
-            f"duration={timestamp_step}:time_base=1/90000"
-        )
         args = [
             "ffmpeg",
             "-hide_banner",
@@ -170,6 +177,17 @@ class Publisher:
             "-flags", "low_delay",
             "-analyzeduration", "1000000",
             "-probesize", "1000000",
+            # Raw H.264 over the pipe carries no timestamps of its own.
+            # A synthetic frame-counter clock (the old setts filter) can't
+            # track these cameras' variable, sub-nominal frame rate, so
+            # video time drifts against audio's sample-count clock until
+            # the RTSP muxer starves waiting for the "behind" stream.
+            # Stamp each frame with its arrival wall-clock time instead, so
+            # video is paced by real elapsed time; the audio input keeps
+            # its own ADTS-derived PTS (forcing wall-clock onto the aac
+            # demuxer produced non-monotonic DTS -- see git history) and
+            # aresample=async below pulls audio onto this same timeline.
+            "-use_wallclock_as_timestamps", "1",
             "-f", codec,
             "-i", "pipe:0",
         ]
@@ -199,44 +217,42 @@ class Publisher:
                 "-c:v", "copy",
                 "-c:a", "libopus",
                 "-b:a", "32k",
-                # No resampling needed here: the audio is already 8kHz,
-                # one of libopus's native input rates. aresample's
-                # "async" drift correction (carried over from
-                # mediamtx.yml's separate transcode step, a different
-                # context with a real RTSP source) was masking, not
-                # fixing, a real timestamp bug -- see the git history
-                # for -use_wallclock_as_timestamps on this input.
+                # Resample audio onto video's wall-clock timeline,
+                # inserting/dropping samples across the gaps that VAD-gated
+                # voice audio leaves in the sample-count clock instead of
+                # letting them accumulate into a muxer stall. Matches
+                # mediamtx.yml's transcode steps.
+                "-af", "aresample=async=1000",
             ]
             pass_fds = (audio_read,)
         else:
             args += ["-an", "-c:v", "copy"]
-        args += [
-            "-bsf:v", timestamp_filter,
-        ]
         if self.has_audio:
-            # The RTSP muxer interleaves packets from both streams in
-            # timestamp order by default, buffering whichever stream is
-            # "ahead" until the other catches up. With H.264 video at
-            # ~1.2Mbps against ~32kbps Opus audio -- and neither stream
-            # on a clock that exactly matches the camera's real delivery
-            # rate -- that wait can grow unbounded and never resolve.
-            # Disable strict interleaving so the muxer writes packets as
-            # they arrive instead of holding one stream hostage to the
-            # other.
-            args += ["-max_interleave_delta", "0"]
+            # Bound how long the RTSP muxer will hold the "ahead" stream
+            # waiting for the other to catch up in DTS order. FFmpeg's
+            # default is 10s and "0" means *unlimited* (a previous version
+            # of this line set 0 and made the wedge permanent instead of
+            # self-clearing). With both streams now on a wall-clock pace,
+            # imbalance stays small; cap it low so any transient (a network
+            # hiccup, a rate change mid-stream) is flushed rather than
+            # allowed to back up until our audio-write timeout kills the
+            # process.
+            args += ["-max_interleave_delta", "500000"]
         args += [
             "-f", "rtsp",
             "-rtsp_transport", "tcp",
             target,
         ]
         LOGGER.info(
-            "starting publisher path=rtc/%s videoCodec=%s frameRate=%s audio=%s",
-            self.path, codec, frame_rate, self.has_audio)
+            "starting publisher path=rtc/%s videoCodec=%s audio=%s",
+            self.path, codec, self.has_audio)
         self.process = await asyncio.create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             pass_fds=pass_fds,
         )
+        asyncio.ensure_future(self._log_stderr(self.process))
         if audio_read is not None:
             os.close(audio_read)
             # A plain blocking write() to this pipe (as used to be done
@@ -251,10 +267,35 @@ class Publisher:
                 asyncio.streams.FlowControlMixin, os.fdopen(audio_write, "wb", buffering=0))
             self.audio_input = asyncio.StreamWriter(transport, protocol, None, loop)
 
+    async def _log_stderr(self, process):
+        # FFmpeg block-buffers stderr when it isn't a TTY, so the useful
+        # startup diagnostics (input/output stream info, mapping, and any
+        # "Non-monotonic DTS" / "Queue input backward" warnings) are lost
+        # when we kill a wedged process. Drain it line by line instead.
+        stream = process.stderr
+        if not isinstance(stream, asyncio.StreamReader):
+            return
+        buffer = ""
+        try:
+            while chunk := await stream.read(4096):
+                buffer += chunk.decode("utf-8", "replace")
+                buffer = buffer.replace("\r", "\n")
+                *lines, buffer = buffer.split("\n")
+                for line in lines:
+                    if line.strip():
+                        LOGGER.info("ffmpeg[%s] %s", self.path, line)
+        except Exception:
+            pass
+
     async def write(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
-        if not is_audio and not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
-            frame = b"\x00\x00\x00\x01" + frame
+        if is_audio:
+            self.last_audio_at = time.monotonic()
+            frame = prepare_audio_frame(frame, self.audio_codec, self.audio_sample_rate)
+        else:
+            self.last_video_at = time.monotonic()
+            if not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
+                frame = b"\x00\x00\x00\x01" + frame
 
         if not self.decided:
             self.pending.append((frame, data_type, payload_type))
@@ -304,8 +345,8 @@ class Publisher:
                     if self.audio_payload_type != payload_type:
                         self.audio_payload_type = payload_type
                         LOGGER.info("JT1078 audio path=%s payloadType=%d", self.path, payload_type)
-                    self.audio_input.write(prepare_audio_frame(
-                        frame, self.audio_codec, self.audio_sample_rate))
+                    # Already ADTS-framed in write().
+                    self.audio_input.write(frame)
                     # If FFmpeg's audio pipeline ever stalls mid-stream
                     # (the same class of internal wedge seen during
                     # startup probing, just happening later), drain()
@@ -369,6 +410,77 @@ class Publisher:
 # registry lets a new connection evict that stale publisher immediately
 # instead of waiting on a TCP-level cleanup that may never come.
 ACTIVE_PUBLISHERS = {}
+
+
+def publisher_status(namespace: str, imei: str, channel: str) -> dict:
+    # channel is the *output* channel (post JT1078_CHANNEL_OFFSET), i.e. the
+    # one that appears in the MediaMTX/WHEP path -- match Publisher.path
+    # directly rather than trying to reverse the offset.
+    target = f"{namespace}/{channel}/{imei}"
+    publisher = next(
+        (p for p in ACTIVE_PUBLISHERS.values() if p.path == target), None)
+    now = time.monotonic()
+
+    def age_ms(timestamp):
+        return None if timestamp is None else round((now - timestamp) * 1000)
+
+    if publisher is None:
+        return {
+            "connected": False, "publishing": False, "decided": False,
+            "hasVideo": False, "hasAudio": False,
+            "videoAgeMs": None, "audioAgeMs": None, "uptimeMs": None,
+            "restarts": 0,
+        }
+    process = publisher.process
+    return {
+        "connected": True,
+        "publishing": process is not None and process.returncode is None,
+        "decided": publisher.decided,
+        "hasVideo": publisher.last_video_at is not None,
+        "hasAudio": publisher.has_audio,
+        "videoAgeMs": age_ms(publisher.last_video_at),
+        "audioAgeMs": age_ms(publisher.last_audio_at),
+        "uptimeMs": age_ms(publisher.started_at),
+        "restarts": publisher.restart_count,
+    }
+
+
+async def handle_status(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # Minimal HTTP/1.1: GET /status/{imei}/{channel}
+    #                or GET /status/{namespace}/{imei}/{channel}  (namespace: live|playback)
+    body = b"{}"
+    status = "404 Not Found"
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        while True:  # discard headers up to the blank line
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+        parts = request_line.split()
+        if len(parts) >= 2 and parts[0] == b"GET":
+            segments = [s for s in parts[1].split(b"?")[0].decode(
+                "ascii", "replace").strip("/").split("/") if s]
+            if len(segments) in (3, 4) and segments[0] == "status":
+                rest = segments[1:]
+                namespace, imei, channel = (
+                    ("live", *rest) if len(rest) == 2 else rest)
+                if namespace in ("live", "playback"):
+                    body = json.dumps(publisher_status(
+                        namespace, imei, channel)).encode()
+                    status = "200 OK"
+        writer.write((
+            f"HTTP/1.1 {status}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + body)
+        await writer.drain()
+    except (asyncio.TimeoutError, ConnectionError):
+        pass
+    finally:
+        writer.close()
 
 
 class Connection:
@@ -464,18 +576,22 @@ async def handle_connection(
 async def main():
     live_port = int(os.getenv("JT1078_LIVE_PORT", "10002"))
     playback_port = int(os.getenv("JT1078_PLAYBACK_PORT", "10003"))
+    status_port = int(os.getenv("JT1078_STATUS_PORT", "10004"))
     live_server = await asyncio.start_server(
         lambda reader, writer: handle_connection(reader, writer, "live"),
         "0.0.0.0", live_port)
     playback_server = await asyncio.start_server(
         lambda reader, writer: handle_connection(reader, writer, "playback"),
         "0.0.0.0", playback_port)
+    status_server = await asyncio.start_server(handle_status, "0.0.0.0", status_port)
     LOGGER.info("JT1078 live receiver listening on port %d", live_port)
     LOGGER.info("JT1078 playback receiver listening on port %d", playback_port)
-    async with live_server, playback_server:
+    LOGGER.info("JT1078 status endpoint listening on port %d", status_port)
+    async with live_server, playback_server, status_server:
         await asyncio.gather(
             live_server.serve_forever(),
-            playback_server.serve_forever())
+            playback_server.serve_forever(),
+            status_server.serve_forever())
 
 
 if __name__ == "__main__":
