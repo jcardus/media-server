@@ -192,6 +192,20 @@ class Publisher:
                 # bounds as small as FFmpeg allows.
                 "-analyzeduration", "100000",
                 "-probesize", "4096",
+                # Video runs on a synthetic, frame-count-based clock (see
+                # the setts bitstream filter below) with no relation to
+                # real elapsed time; left alone, audio's own AAC-sample-
+                # count-based clock has no shared reference with it. Any
+                # mismatch between each clock's assumed rate and the
+                # camera's actual delivery rate accumulates until the
+                # two streams' timelines have drifted apart enough that
+                # the RTSP muxer -- which interleaves packets from both
+                # streams in timestamp order -- stalls waiting for one
+                # side to "catch up" (observed in production: a rock-
+                # solid ~20s into every audio-enabled stream). Anchor
+                # audio to real wall-clock time so it can't drift
+                # indefinitely away from video's roughly-real-time pace.
+                "-use_wallclock_as_timestamps", "1",
                 *audio_options,
                 "-i", f"pipe:{audio_read}",
                 "-map", "0:v:0",
