@@ -8,15 +8,17 @@ services:
     ports:
       - "10002:10002"
       - "10003:10003"
+      - "10004:10004"
     environment:
       - JT1078_LIVE_PORT=10002
       - JT1078_PLAYBACK_PORT=10003
+      - JT1078_STATUS_PORT=10004
       - JT1078_CHANNEL_OFFSET=1
       - JT1078_VIDEO_CODEC=h264
       # JT/T 1078 payload type 19 reported by the camera is AAC.
       - JT1078_AUDIO_CODEC=aac
       - JT1078_AUDIO_SAMPLE_RATE=8000
-      - FFMPEG_LOG_LEVEL=debug
+      - FFMPEG_LOG_LEVEL=verbose
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
@@ -24,10 +26,23 @@ services:
     restart: unless-stopped
     ports:
       - "1936:1936"   # RTMP — Jimi cameras push to rtmp://host:1936/live/{channel}/{imei} (DNS-only)
-      - "80:8889"     # WebRTC — browsers open https://media.n-gps.com/live/{channel}/{imei} (Cloudflare-proxied)
       - "8189:8189/udp" # WebRTC ICE media
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
       - ./recordings:/recordings
     environment:
       - MTX_LOGLEVEL=info
+
+  # Edge on :80 for media.n-gps.com: MediaMTX WebRTC as before, plus
+  # /media-status/ -> jt1078 :10004 /status endpoint.
+  nginx:
+    image: nginx:alpine
+    container_name: media-nginx
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+      - jt1078
+    ports:
+      - "80:80"       # WebRTC — browsers open https://media.n-gps.com/... (Cloudflare-proxied)
+    volumes:
+      - ./nginx/media-edge.conf:/etc/nginx/conf.d/default.conf:ro
