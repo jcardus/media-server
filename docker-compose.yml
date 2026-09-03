@@ -19,10 +19,6 @@ services:
       - JT1078_AUDIO_CODEC=aac
       - JT1078_AUDIO_SAMPLE_RATE=8000
       - FFMPEG_LOG_LEVEL=verbose
-      # Temporary: keep ffmpeg's per-frame progress and any "Non-monotonic
-      # DTS" lines visible while validating the wall-clock video timestamp
-      # change on this branch.
-      - LOG_LEVEL=DEBUG
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
