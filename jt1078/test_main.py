@@ -166,7 +166,6 @@ class ConnectionTest(unittest.IsolatedAsyncioTestCase):
             second = Connection(("1.2.3.4", 2), "live")
             await second.process(make_packet())
             second_publisher = second.publishers[("860112070346616", 1)]
-            await asyncio.sleep(0)
 
         close.assert_called_once()
         self.assertIsNot(first_publisher, second_publisher)

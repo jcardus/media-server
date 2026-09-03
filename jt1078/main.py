@@ -374,7 +374,11 @@ class Connection:
             stale = ACTIVE_PUBLISHERS.get(registry_key)
             if stale is not None:
                 LOGGER.warning("replacing stale publisher path=%s", stale.path)
-                asyncio.ensure_future(stale.close())
+                # Must finish before the new publisher connects: MediaMTX
+                # only allows one publisher per path, so starting the new
+                # ffmpeg process while the stale one is still tearing down
+                # races and can get the new process rejected/killed too.
+                await stale.close()
             publisher = Publisher(*key, self.namespace)
             self.publishers[key] = publisher
             ACTIVE_PUBLISHERS[registry_key] = publisher
