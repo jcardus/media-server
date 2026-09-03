@@ -1,5 +1,6 @@
+import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from main import MAGIC, PacketParser, Publisher, audio_input_options, decode_terminal_id, prepare_audio_frame
 
@@ -81,6 +82,53 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual((), create.call_args.kwargs["pass_fds"])
         self.assertIsNotNone(publisher.audio_input)
         publisher.audio_input.close()
+
+    async def test_buffers_video_until_audio_arrives_then_commits_once(self):
+        publisher = Publisher("860112070346616", 1, "live")
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+
+        async def fake_start():
+            publisher.process = process
+            publisher.audio_input = MagicMock() if publisher.has_audio else None
+
+        with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)) as start:
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=96)
+            start.assert_not_called()
+            self.assertFalse(publisher.decided)
+
+            await publisher.write(b"audio", data_type=3, payload_type=19)
+
+        start.assert_called_once()
+        self.assertTrue(publisher.decided)
+        self.assertTrue(publisher.has_audio)
+        process.stdin.write.assert_called_once_with(b"\x00\x00\x00\x01video")
+        publisher.audio_input.write.assert_called_once()
+        self.assertEqual([], publisher.pending)
+
+    async def test_commits_video_only_after_grace_period(self):
+        publisher = Publisher("860112070346616", 1, "live")
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+
+        async def fake_start():
+            publisher.process = process
+            publisher.audio_input = MagicMock() if publisher.has_audio else None
+
+        with patch.dict("os.environ", {"JT1078_AUDIO_GRACE_SECONDS": "0.01"}):
+            with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)) as start:
+                await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=96)
+                start.assert_not_called()
+                await asyncio.sleep(0.05)
+
+        start.assert_called_once()
+        self.assertTrue(publisher.decided)
+        self.assertFalse(publisher.has_audio)
+        process.stdin.write.assert_called_once_with(b"\x00\x00\x00\x01video")
 
 
 if __name__ == "__main__":

@@ -137,10 +137,18 @@ class Publisher:
         self.audio_payload_type = None
         self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
         self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
-        # Channels that never send audio must not block video: FFmpeg blocks
-        # opening a second -i until it can probe it, so the audio input is
-        # only added once we have actually observed an audio packet.
+        # Whether to include an audio input in the ffmpeg command. Channels
+        # that never send audio must not block video: FFmpeg blocks opening
+        # a second -i until it can probe it. A new publisher waits a short
+        # grace period for a first audio packet before committing to a
+        # pipeline shape and spawning ffmpeg, buffering frames meanwhile —
+        # restarting ffmpeg after the fact throws away the camera's only
+        # SPS/PPS, which breaks the decoder for the rest of the connection.
         self.has_audio = False
+        self.decided = False
+        self.pending = []
+        self.grace_handle = None
+        self.grace_task = None
 
     async def start(self):
         if self.audio_input:
@@ -206,11 +214,44 @@ class Publisher:
         is_audio = data_type == 3
         if not is_audio and not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
             frame = b"\x00\x00\x00\x01" + frame
+
+        if not self.decided:
+            self.pending.append((frame, data_type, payload_type))
+            if is_audio:
+                self.has_audio = True
+                if self.grace_handle is not None:
+                    self.grace_handle.cancel()
+                    self.grace_handle = None
+                await self._commit()
+            elif self.grace_handle is None:
+                grace = float(os.getenv("JT1078_AUDIO_GRACE_SECONDS", "0.5"))
+                self.grace_handle = asyncio.get_event_loop().call_later(
+                    grace, self._on_grace_expired)
+            return
+
         if is_audio and not self.has_audio:
             self.has_audio = True
             if self.process is not None and self.process.returncode is None:
                 LOGGER.info("audio detected, restarting publisher path=%s", self.path)
                 await self.close()
+
+        await self._deliver(frame, data_type, payload_type)
+
+    def _on_grace_expired(self):
+        self.grace_handle = None
+        self.grace_task = asyncio.ensure_future(self._commit())
+
+    async def _commit(self):
+        if self.decided:
+            return
+        self.decided = True
+        pending, self.pending = self.pending, []
+        await self.start()
+        for frame, data_type, payload_type in pending:
+            await self._deliver(frame, data_type, payload_type)
+
+    async def _deliver(self, frame: bytes, data_type: int, payload_type: int):
+        is_audio = data_type == 3
         for attempt in range(2):
             if self.process is None or self.process.returncode is not None:
                 if self.process is not None:
@@ -237,6 +278,10 @@ class Publisher:
                     raise
 
     async def close(self):
+        if self.grace_handle is not None:
+            self.grace_handle.cancel()
+            self.grace_handle = None
+        self.pending = []
         if self.process is None:
             return
         if self.audio_input:
