@@ -79,10 +79,17 @@ def _dest(stored_name):
     return STORE_DIR / "_unsorted" / stored_name
 
 
-def _ok():
-    # The camera treats any body without `code == 0` as failure and re-POSTs
-    # the file every few minutes forever.
-    return web.json_response({"code": 0, "msg": "success"})
+def _ok(url=""):
+    # The camera reports UPLOADFILEFAIL and re-POSTs every ~5 min unless it gets
+    # the response it wants. The exact contract isn't documented, so cover the
+    # common shapes (code/result/ret/status) and echo the stored file's URL.
+    body = {"code": 0, "msg": "success", "result": 0, "ret": 0,
+            "status": "success", "success": True}
+    if url:
+        body["url"] = url
+        body["fileUrl"] = url
+        body["data"] = {"url": url, "fileUrl": url, "fileAddress": url}
+    return web.json_response(body)
 
 
 def _fail(msg, status=200):
@@ -122,8 +129,9 @@ async def handle_upload(request: web.Request) -> web.Response:
     dest = _dest(stored)
     dest.parent.mkdir(parents=True, exist_ok=True)
     pending.replace(dest)
-    log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR), dest.stat().st_size)
-    return _ok()
+    rel = dest.relative_to(STORE_DIR).as_posix()
+    log.info("stored %s (%d bytes)", rel, dest.stat().st_size)
+    return _ok(f"{request.scheme}://{request.host}/attachments/{rel}")
 
 
 async def _handle_raw(request: web.Request) -> web.Response:
