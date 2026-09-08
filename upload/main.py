@@ -16,6 +16,7 @@ Files are stored under STORE_DIR/<imei>/<alarmLabel>/<filename> and served
 back over HTTP so the frontend can list and play an event's media.
 """
 import hashlib
+import json
 import logging
 import os
 import re
@@ -185,7 +186,7 @@ async def handle_list(request: web.Request) -> web.Response:
             "url": f"/attachments/{imei}/{label}/{entry.name}",
         }
         for entry in sorted(directory.iterdir())
-        if entry.is_file() and not entry.name.endswith(".part")
+        if entry.is_file() and not entry.name.startswith(".") and not entry.name.endswith(".part")
     ]
     return web.json_response({"files": files})
 
@@ -214,9 +215,42 @@ def _label_time_ms(label):
         return None
 
 
+async def handle_event_meta(request: web.Request) -> web.Response:
+    """Traccar POSTs {imei, identifier, type, alarm, level, time} when it decodes
+    an ADAS/DMS alarm - the label alone can't tell fatigue from lane departure."""
+    # Read the raw body ourselves: some clients (Traccar's java.net.http client
+    # attempting an h2c upgrade) send the POST with no Content-Length, so
+    # request.json() sees an empty payload and the real bytes would otherwise
+    # land in the keep-alive parser's tail and 500 the worker. Close the
+    # connection after replying so a mis-framed tail can never be re-parsed.
+    raw = await request.read()
+    if not raw:
+        log.warning("event meta: empty body from %s (no Content-Length?)", request.remote)
+        resp = _ok("")
+        resp.force_close()
+        return resp
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return _fail("bad json", 400)
+    imei = sanitize(str(body.get("imei", "")))
+    identifier = sanitize(str(body.get("identifier", ""))).lower()
+    if not imei or not identifier:
+        return _fail("imei and identifier required", 400)
+    folder = STORE_DIR / imei / identifier
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = {k: body[k] for k in ("type", "alarm", "level", "time", "kind") if body.get(k) is not None}
+    (folder / ".meta.json").write_text(json.dumps(meta))
+    log.info("event meta %s/%s %s", imei, identifier, meta)
+    resp = _ok(identifier)
+    resp.force_close()
+    return resp
+
+
 async def handle_events(request: web.Request) -> web.Response:
-    """Every event folder we hold media for, newest first - the frontend uses
-    this because this Traccar instance can't return historical alarm positions."""
+    """Every event folder we hold media for (or have metadata for), newest first
+    - the frontend uses this because this Traccar instance can't return
+    historical alarm positions."""
     imei = sanitize(request.match_info["imei"])
     root = STORE_DIR / imei
     events = []
@@ -224,15 +258,23 @@ async def handle_events(request: web.Request) -> web.Response:
         for entry in root.iterdir():
             if not entry.is_dir() or entry.name.startswith("_"):
                 continue
-            files = [f for f in entry.iterdir() if f.is_file() and not f.name.endswith(".part")]
-            if not files:
+            files = [f for f in entry.iterdir()
+                     if f.is_file() and not f.name.startswith(".") and not f.name.endswith(".part")]
+            meta_path = entry / ".meta.json"
+            if not files and not meta_path.is_file():
                 continue
-            events.append({
+            event = {
                 "identifier": entry.name,
                 "time": _label_time_ms(entry.name),
                 "fileCount": len(files),
                 "hasVideo": any(f.suffix.lower() in (".mp4", ".h264") for f in files),
-            })
+            }
+            if meta_path.is_file():
+                try:
+                    event.update({k: v for k, v in json.loads(meta_path.read_text()).items() if v is not None})
+                except Exception:
+                    pass
+            events.append(event)
     events.sort(key=lambda e: e["time"] or 0, reverse=True)
     return web.json_response({"events": events})
 
@@ -260,6 +302,7 @@ async def cors(request: web.Request, handler):
 def build_app() -> web.Application:
     app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024, middlewares=[cors])
     app.router.add_post("/upload", handle_upload)
+    app.router.add_post("/event", handle_event_meta)
     for pattern in ("/attachments/{imei}", "/attachments/{imei}/"):
         app.router.add_get(pattern, handle_events)
     for pattern in ("/attachments/{imei}/{label}", "/attachments/{imei}/{label}/"):
