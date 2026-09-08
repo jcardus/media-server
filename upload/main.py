@@ -165,15 +165,31 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
     path = STORE_DIR / imei / label / name
     if not path.is_file():
         raise web.HTTPNotFound()
-    return web.FileResponse(path, headers={"Access-Control-Allow-Origin": "*"})
+    return web.FileResponse(path)
 
 
 async def handle_health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+@web.middleware
+async def cors(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            exc.headers["Access-Control-Allow-Origin"] = "*"
+            raise
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    response.headers.setdefault("Access-Control-Allow-Headers", "*")
+    return response
+
+
 def build_app() -> web.Application:
-    app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024)
+    app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024, middlewares=[cors])
     app.router.add_post("/upload", handle_upload)
     for pattern in ("/attachments/{imei}/{label}", "/attachments/{imei}/{label}/"):
         app.router.add_get(pattern, handle_list)
