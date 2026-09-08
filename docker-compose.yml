@@ -33,8 +33,23 @@ services:
     environment:
       - MTX_LOGLEVEL=info
 
+  # Event-attachment sink: JT/T 808 dashcams POST /upload here (direct, plain
+  # HTTP to host:10005) after a VIDEOUPLOAD command; files served back for the
+  # frontend. See upload/main.py.
+  upload:
+    build: ./upload
+    container_name: media-upload
+    restart: unless-stopped
+    ports:
+      - "10005:10005"
+    environment:
+      - UPLOAD_PORT=10005
+      - STORE_DIR=/data/attachments
+    volumes:
+      - ./attachments:/data/attachments
+
   # Edge on :80 for media.n-gps.com: MediaMTX WebRTC as before, plus
-  # /media-status/ -> jt1078 :10004 /status endpoint.
+  # /media-status/ -> jt1078 :10004 /status endpoint and /attachments/ -> upload.
   nginx:
     image: nginx:alpine
     container_name: media-nginx
@@ -42,6 +57,7 @@ services:
     depends_on:
       - mediamtx
       - jt1078
+      - upload
     ports:
       - "80:80"       # WebRTC — browsers open https://media.n-gps.com/... (Cloudflare-proxied)
     volumes:
