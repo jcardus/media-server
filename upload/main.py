@@ -3,18 +3,22 @@ Event-attachment sink for Jimi JT/T 808 dashcams.
 
 Traccar answers an ADAS/DMS alarm (0x64/0x65) with
 `VIDEOUPLOAD,<host>,<port>,<alarmLabel>,<channel>,<type>#`; the camera then
-does `POST /upload` here with the event clip (.mp4) and snapshots (.jpg),
-named `<imei>_<alarmLabel>_<xy>.<ext>` (xy = channel + serial, per Jimi docs).
+`POST /upload`s the event clip (.mp4) and snapshots (.jpg) as multipart:
+  file       the binary (its own filename is just <channel>_<epoch>)
+  filename   <imei>_<alarmLabel(32 hex)>_<channel>_<seq>.<ext>   <- the real key
+  timestamp  epoch ms
+  sign       base64 HMAC (not verified here)
+Reply must be {"code": 0, ...} or the camera re-POSTs every few minutes.
 
-Files are stored under STORE_DIR/<imei>/<alarmLabel>/ and served back over
-HTTP so the frontend can list and play an event's media by its label.
+Files are stored under STORE_DIR/<imei>/<alarmLabel>/<filename> and served
+back over HTTP so the frontend can list and play an event's media.
 """
-import json
 import logging
 import os
 import re
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from aiohttp import web
 
@@ -27,7 +31,8 @@ MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(256 * 1024 * 1024)))
 ALLOWED_EXT = {".mp4", ".h264", ".jpg", ".jpeg", ".png"}
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
-NAME_PARTS = re.compile(r"^(\d{10,17})_([0-9A-Fa-f]{8,64})_(.+)$")
+# The camera's `filename` form field: <imei>_<alarmLabel(32 hex)>_<channel>_<seq>.<ext>
+FILENAME_FIELD = re.compile(r"^(\d{10,17})_([0-9A-Fa-f]{8,64})_")
 
 
 def sanitize(name: str) -> str:
@@ -66,72 +71,73 @@ async def _iter_body(request, size=64 * 1024):
         yield chunk
 
 
-IMEI_KEYS = ("imei", "deviceImei", "deviceimei", "sn", "terminal")
-LABEL_KEYS = ("alarmLabel", "alarmlabel", "label", "alarm", "alarmId", "alarmid", "warnId")
-
-
-def _pick(mapping, keys):
-    for key in keys:
-        value = mapping.get(key)
-        if value:
-            return value
-    return None
-
-
-def dest_dir(request, filename):
-    """Route by explicit imei/label (query or header), else the filename pattern,
-    else _unsorted/. Also accept them as extra path segments after /upload."""
-    extra = [s for s in request.match_info.get("tail", "").split("/") if s]
-    headers = {k.lower().replace("x-", "").replace("-", ""): v for k, v in request.headers.items()}
-    imei = (extra[0] if len(extra) > 0 else None) or _pick(request.query, IMEI_KEYS) or _pick(headers, ("imei", "deviceimei", "sn"))
-    label = (extra[1] if len(extra) > 1 else None) or _pick(request.query, LABEL_KEYS) or _pick(headers, ("alarmid", "alarmlabel", "label"))
-    if imei and label:
-        return STORE_DIR / sanitize(imei) / sanitize(label).lower()
-    match = NAME_PARTS.match(filename)
+def _dest(stored_name):
+    """<imei>/<alarmLabel>/<name> from the camera's `filename` field, else _unsorted/."""
+    match = FILENAME_FIELD.match(stored_name)
     if match:
-        return STORE_DIR / match.group(1) / match.group(2).lower()
-    return STORE_DIR / "_unsorted"
+        return STORE_DIR / match.group(1) / match.group(2).lower() / stored_name
+    return STORE_DIR / "_unsorted" / stored_name
+
+
+def _ok():
+    # The camera treats any body without `code == 0` as failure and re-POSTs
+    # the file every few minutes forever.
+    return web.json_response({"code": 0, "msg": "success"})
+
+
+def _fail(msg, status=200):
+    return web.json_response({"code": 1, "msg": msg}, status=status)
 
 
 async def handle_upload(request: web.Request) -> web.Response:
     log.info(
-        "POST %s query=%s ct=%r len=%s ua=%r xhdr=%s",
+        "POST %s query=%s ct=%r len=%s ua=%r",
         request.path, dict(request.query), request.content_type,
-        request.headers.get("Content-Length"), request.headers.get("User-Agent"),
-        {k: v for k, v in request.headers.items() if k.lower().startswith("x-")})
+        request.headers.get("Content-Length"), request.headers.get("User-Agent"))
 
-    saved = []
-    if request.content_type and request.content_type.startswith("multipart/"):
-        reader = await request.multipart()
-        async for part in reader:
-            log.info("  part name=%r filename=%r headers=%s", part.name, part.filename, dict(part.headers))
-            if not part.filename:
-                text = (await part.text())[:200]
-                log.info("  field %r = %r", part.name, text)
-                continue
-            name = sanitize(part.filename)
-            if Path(name).suffix.lower() not in ALLOWED_EXT:
-                log.warning("rejected part %r (extension)", part.filename)
-                continue
-            path = dest_dir(request, name) / name
-            size = await _write(path, _iter_part(part))
-            saved.append({"name": name, "bytes": size})
-            log.info("stored %s (%d bytes)", path.relative_to(STORE_DIR), size)
-    else:
-        disp = request.headers.get("Content-Disposition", "")
-        match = re.search(r'filename="?([^"]+)"?', disp)
-        raw = match.group(1) if match else request.query.get("filename") or request.query.get("name")
-        name = sanitize(raw or f"{int(time.time() * 1000)}.bin")
-        if Path(name).suffix.lower() not in ALLOWED_EXT:
-            raise web.HTTPUnsupportedMediaType(text="extension not allowed")
-        path = dest_dir(request, name) / name
-        size = await _write(path, _iter_body(request))
-        saved.append({"name": name, "bytes": size})
-        log.info("stored %s (%d bytes)", path.relative_to(STORE_DIR), size)
+    if not (request.content_type or "").startswith("multipart/"):
+        return await _handle_raw(request)
 
-    if not saved:
-        raise web.HTTPBadRequest(text="no file in request")
-    return web.json_response({"stored": saved})
+    reader = await request.multipart()
+    pending = None
+    suffix = ".bin"
+    fields = {}
+    async for part in reader:
+        if part.name == "file" and part.filename:
+            suffix = Path(sanitize(part.filename)).suffix.lower() or ".bin"
+            pending = STORE_DIR / "_pending" / (uuid4().hex + suffix)
+            await _write(pending, _iter_part(part))
+        else:
+            fields[part.name] = (await part.text())[:256]
+    log.info("  fields=%s pending=%s", fields, bool(pending))
+
+    if pending is None or not pending.exists():
+        return _fail("no file", 400)
+
+    # The `filename` field is <imei>_<alarmLabel>_<channel>_<seq>.<ext>.
+    stored = sanitize(fields.get("filename") or (uuid4().hex + suffix))
+    if Path(stored).suffix.lower() not in ALLOWED_EXT:
+        pending.unlink(missing_ok=True)
+        return _fail("extension not allowed", 415)
+    dest = _dest(stored)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    pending.replace(dest)
+    log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR), dest.stat().st_size)
+    return _ok()
+
+
+async def _handle_raw(request: web.Request) -> web.Response:
+    disp = request.headers.get("Content-Disposition", "")
+    match = re.search(r'filename="?([^"]+)"?', disp)
+    name = sanitize((match.group(1) if match else request.query.get("filename"))
+                    or f"{int(time.time() * 1000)}.bin")
+    if Path(name).suffix.lower() not in ALLOWED_EXT:
+        return _fail("extension not allowed", 415)
+    dest = _dest(name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = await _write(dest, _iter_body(request))
+    log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR), size)
+    return _ok()
 
 
 async def handle_list(request: web.Request) -> web.Response:
@@ -169,7 +175,6 @@ async def handle_health(_request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024)
     app.router.add_post("/upload", handle_upload)
-    app.router.add_post(r"/upload/{tail:.*}", handle_upload)  # tolerate /upload/<imei>/<label>
     for pattern in ("/attachments/{imei}/{label}", "/attachments/{imei}/{label}/"):
         app.router.add_get(pattern, handle_list)
     app.router.add_get("/attachments/{imei}/{label}/{name}", handle_file)
@@ -178,6 +183,8 @@ def build_app() -> web.Application:
 
 
 if __name__ == "__main__":
-    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    (STORE_DIR / "_pending").mkdir(parents=True, exist_ok=True)
+    for leftover in (STORE_DIR / "_pending").glob("*"):
+        leftover.unlink(missing_ok=True)
     log.info("attachment sink on :%d  store=%s", PORT, STORE_DIR)
     web.run_app(build_app(), host="0.0.0.0", port=PORT, print=None)
