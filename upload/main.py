@@ -200,6 +200,43 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path)
 
 
+def _label_time_ms(label):
+    """Alarm identification number: termId[7] time-BCD[6] seq[1] count[1] rsv[1].
+    Bytes 7..12 (hex offsets 14..26) are YYMMDDHHMMSS in BCD."""
+    try:
+        bcd = label[14:26]
+        y, mo, d = 2000 + int(bcd[0:2]), int(bcd[2:4]), int(bcd[4:6])
+        h, mi, s = int(bcd[6:8]), int(bcd[8:10]), int(bcd[10:12])
+        import datetime
+        # camera stamps local time (America/Sao_Paulo, UTC-3)
+        return int((datetime.datetime(y, mo, d, h, mi, s) + datetime.timedelta(hours=3)).timestamp() * 1000)
+    except (ValueError, IndexError):
+        return None
+
+
+async def handle_events(request: web.Request) -> web.Response:
+    """Every event folder we hold media for, newest first - the frontend uses
+    this because this Traccar instance can't return historical alarm positions."""
+    imei = sanitize(request.match_info["imei"])
+    root = STORE_DIR / imei
+    events = []
+    if root.is_dir():
+        for entry in root.iterdir():
+            if not entry.is_dir() or entry.name.startswith("_"):
+                continue
+            files = [f for f in entry.iterdir() if f.is_file() and not f.name.endswith(".part")]
+            if not files:
+                continue
+            events.append({
+                "identifier": entry.name,
+                "time": _label_time_ms(entry.name),
+                "fileCount": len(files),
+                "hasVideo": any(f.suffix.lower() in (".mp4", ".h264") for f in files),
+            })
+    events.sort(key=lambda e: e["time"] or 0, reverse=True)
+    return web.json_response({"events": events})
+
+
 async def handle_health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -223,6 +260,8 @@ async def cors(request: web.Request, handler):
 def build_app() -> web.Application:
     app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024, middlewares=[cors])
     app.router.add_post("/upload", handle_upload)
+    for pattern in ("/attachments/{imei}", "/attachments/{imei}/"):
+        app.router.add_get(pattern, handle_events)
     for pattern in ("/attachments/{imei}/{label}", "/attachments/{imei}/{label}/"):
         app.router.add_get(pattern, handle_list)
     app.router.add_get("/attachments/{imei}/{label}/{name}", handle_file)
