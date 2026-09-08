@@ -34,14 +34,6 @@ def sanitize(name: str) -> str:
     return SAFE_NAME.sub("_", os.path.basename(name or "")).lstrip(".")
 
 
-def target_dir(filename: str) -> Path:
-    """<imei>/<alarmLabel>/ when the name matches the Jimi pattern, else _unsorted/."""
-    match = NAME_PARTS.match(filename)
-    if match:
-        return STORE_DIR / match.group(1) / match.group(2).lower()
-    return STORE_DIR / "_unsorted"
-
-
 async def _write(path: Path, chunks) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -74,18 +66,54 @@ async def _iter_body(request, size=64 * 1024):
         yield chunk
 
 
+IMEI_KEYS = ("imei", "deviceImei", "deviceimei", "sn", "terminal")
+LABEL_KEYS = ("alarmLabel", "alarmlabel", "label", "alarm", "alarmId", "alarmid", "warnId")
+
+
+def _pick(mapping, keys):
+    for key in keys:
+        value = mapping.get(key)
+        if value:
+            return value
+    return None
+
+
+def dest_dir(request, filename):
+    """Route by explicit imei/label (query or header), else the filename pattern,
+    else _unsorted/. Also accept them as extra path segments after /upload."""
+    extra = [s for s in request.match_info.get("tail", "").split("/") if s]
+    headers = {k.lower().replace("x-", "").replace("-", ""): v for k, v in request.headers.items()}
+    imei = (extra[0] if len(extra) > 0 else None) or _pick(request.query, IMEI_KEYS) or _pick(headers, ("imei", "deviceimei", "sn"))
+    label = (extra[1] if len(extra) > 1 else None) or _pick(request.query, LABEL_KEYS) or _pick(headers, ("alarmid", "alarmlabel", "label"))
+    if imei and label:
+        return STORE_DIR / sanitize(imei) / sanitize(label).lower()
+    match = NAME_PARTS.match(filename)
+    if match:
+        return STORE_DIR / match.group(1) / match.group(2).lower()
+    return STORE_DIR / "_unsorted"
+
+
 async def handle_upload(request: web.Request) -> web.Response:
+    log.info(
+        "POST %s query=%s ct=%r len=%s ua=%r xhdr=%s",
+        request.path, dict(request.query), request.content_type,
+        request.headers.get("Content-Length"), request.headers.get("User-Agent"),
+        {k: v for k, v in request.headers.items() if k.lower().startswith("x-")})
+
     saved = []
     if request.content_type and request.content_type.startswith("multipart/"):
         reader = await request.multipart()
         async for part in reader:
+            log.info("  part name=%r filename=%r headers=%s", part.name, part.filename, dict(part.headers))
             if not part.filename:
+                text = (await part.text())[:200]
+                log.info("  field %r = %r", part.name, text)
                 continue
             name = sanitize(part.filename)
             if Path(name).suffix.lower() not in ALLOWED_EXT:
                 log.warning("rejected part %r (extension)", part.filename)
                 continue
-            path = target_dir(name) / name
+            path = dest_dir(request, name) / name
             size = await _write(path, _iter_part(part))
             saved.append({"name": name, "bytes": size})
             log.info("stored %s (%d bytes)", path.relative_to(STORE_DIR), size)
@@ -96,7 +124,7 @@ async def handle_upload(request: web.Request) -> web.Response:
         name = sanitize(raw or f"{int(time.time() * 1000)}.bin")
         if Path(name).suffix.lower() not in ALLOWED_EXT:
             raise web.HTTPUnsupportedMediaType(text="extension not allowed")
-        path = target_dir(name) / name
+        path = dest_dir(request, name) / name
         size = await _write(path, _iter_body(request))
         saved.append({"name": name, "bytes": size})
         log.info("stored %s (%d bytes)", path.relative_to(STORE_DIR), size)
@@ -141,7 +169,9 @@ async def handle_health(_request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     app = web.Application(client_max_size=MAX_BYTES + 1024 * 1024)
     app.router.add_post("/upload", handle_upload)
-    app.router.add_get("/attachments/{imei}/{label}", handle_list)
+    app.router.add_post(r"/upload/{tail:.*}", handle_upload)  # tolerate /upload/<imei>/<label>
+    for pattern in ("/attachments/{imei}/{label}", "/attachments/{imei}/{label}/"):
+        app.router.add_get(pattern, handle_list)
     app.router.add_get("/attachments/{imei}/{label}/{name}", handle_file)
     app.router.add_get("/health", handle_health)
     return app
