@@ -218,8 +218,19 @@ def _label_time_ms(label):
 async def handle_event_meta(request: web.Request) -> web.Response:
     """Traccar POSTs {imei, identifier, type, alarm, level, time} when it decodes
     an ADAS/DMS alarm - the label alone can't tell fatigue from lane departure."""
+    # Read the raw body ourselves: some clients (Traccar's java.net.http client
+    # attempting an h2c upgrade) send the POST with no Content-Length, so
+    # request.json() sees an empty payload and the real bytes would otherwise
+    # land in the keep-alive parser's tail and 500 the worker. Close the
+    # connection after replying so a mis-framed tail can never be re-parsed.
+    raw = await request.read()
+    if not raw:
+        log.warning("event meta: empty body from %s (no Content-Length?)", request.remote)
+        resp = _ok("")
+        resp.force_close()
+        return resp
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         return _fail("bad json", 400)
     imei = sanitize(str(body.get("imei", "")))
@@ -231,7 +242,9 @@ async def handle_event_meta(request: web.Request) -> web.Response:
     meta = {k: body[k] for k in ("type", "alarm", "level", "time", "kind") if body.get(k) is not None}
     (folder / ".meta.json").write_text(json.dumps(meta))
     log.info("event meta %s/%s %s", imei, identifier, meta)
-    return _ok(identifier)
+    resp = _ok(identifier)
+    resp.force_close()
+    return resp
 
 
 async def handle_events(request: web.Request) -> web.Response:
