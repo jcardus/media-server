@@ -7,12 +7,15 @@ Traccar answers an ADAS/DMS alarm (0x64/0x65) with
   file       the binary (its own filename is just <channel>_<epoch>)
   filename   <imei>_<alarmLabel(32 hex)>_<channel>_<seq>.<ext>   <- the real key
   timestamp  epoch ms
-  sign       base64 HMAC (not verified here)
-Reply must be {"code": 0, ...} or the camera re-POSTs every few minutes.
+  sign       md5(filename + timestamp + "jimidvr@123!443") hex, base64-wrapped
+Reply must be Jimi dvr-upload's exact body
+  {"code": 200, "message": "File upload success", "data": <filename>}
+or the camera reports UPLOADFILEFAIL and re-POSTs every ~5 min.
 
 Files are stored under STORE_DIR/<imei>/<alarmLabel>/<filename> and served
 back over HTTP so the frontend can list and play an event's media.
 """
+import hashlib
 import logging
 import os
 import re
@@ -29,6 +32,11 @@ PORT = int(os.getenv("UPLOAD_PORT", "10005"))
 STORE_DIR = Path(os.getenv("STORE_DIR", "/data/attachments"))
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(256 * 1024 * 1024)))
 ALLOWED_EXT = {".mp4", ".h264", ".jpg", ".jpeg", ".png"}
+# Jimi dvr-upload contract: sign = md5(filename + timestamp + SECRET), lowercase
+# hex. The camera then base64-wraps that hex string. Reject bad signs only when
+# STRICT_SIGN is set - otherwise just log.
+SIGN_SECRET = os.getenv("SIGN_SECRET", "jimidvr@123!443")
+STRICT_SIGN = os.getenv("STRICT_SIGN", "") not in ("", "0", "false")
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 # The camera's `filename` form field: <imei>_<alarmLabel(32 hex)>_<channel>_<seq>.<ext>
@@ -79,14 +87,28 @@ def _dest(stored_name):
     return STORE_DIR / "_unsorted" / stored_name
 
 
-def _ok():
-    # The camera treats any body without `code == 0` as failure and re-POSTs
-    # the file every few minutes forever.
-    return web.json_response({"code": 0, "msg": "success"})
+def _ok(filename):
+    # dvr-upload's exact success body - anything else and the camera reports
+    # UPLOADFILEFAIL and re-POSTs every ~5 min.
+    return web.json_response({"code": 200, "message": "File upload success", "data": filename})
 
 
-def _fail(msg, status=200):
-    return web.json_response({"code": 1, "msg": msg}, status=status)
+def _fail(message, status=400):
+    return web.json_response({"code": status, "message": message}, status=status)
+
+
+def _sign_ok(filename, timestamp, sign):
+    if not sign:
+        return False
+    want = hashlib.md5((filename + timestamp + SIGN_SECRET).encode("utf-8")).hexdigest()
+    got = sign.strip().lower()
+    if len(got) != 32:  # camera also sends base64(hex)
+        try:
+            import base64
+            got = base64.b64decode(sign).decode().strip().lower()
+        except Exception:
+            pass
+    return got == want
 
 
 async def handle_upload(request: web.Request) -> web.Response:
@@ -112,18 +134,28 @@ async def handle_upload(request: web.Request) -> web.Response:
     log.info("  fields=%s pending=%s", fields, bool(pending))
 
     if pending is None or not pending.exists():
-        return _fail("no file", 400)
+        return _fail("The file content is empty", 400)
+
+    name_field = fields.get("filename", "")
+    if not name_field:
+        pending.unlink(missing_ok=True)
+        return _fail("The filename cannot be empty", 400)
+    if not _sign_ok(name_field, fields.get("timestamp", ""), fields.get("sign", "")):
+        log.warning("sign mismatch for %s (ts=%s)", name_field, fields.get("timestamp"))
+        if STRICT_SIGN:
+            pending.unlink(missing_ok=True)
+            return _fail("Signature error", 400)
 
     # The `filename` field is <imei>_<alarmLabel>_<channel>_<seq>.<ext>.
-    stored = sanitize(fields.get("filename") or (uuid4().hex + suffix))
+    stored = sanitize(name_field)
     if Path(stored).suffix.lower() not in ALLOWED_EXT:
         pending.unlink(missing_ok=True)
-        return _fail("extension not allowed", 415)
+        return _fail("extension not allowed", 400)
     dest = _dest(stored)
     dest.parent.mkdir(parents=True, exist_ok=True)
     pending.replace(dest)
-    log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR), dest.stat().st_size)
-    return _ok()
+    log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR).as_posix(), dest.stat().st_size)
+    return _ok(name_field)
 
 
 async def _handle_raw(request: web.Request) -> web.Response:
@@ -132,12 +164,12 @@ async def _handle_raw(request: web.Request) -> web.Response:
     name = sanitize((match.group(1) if match else request.query.get("filename"))
                     or f"{int(time.time() * 1000)}.bin")
     if Path(name).suffix.lower() not in ALLOWED_EXT:
-        return _fail("extension not allowed", 415)
+        return _fail("extension not allowed", 400)
     dest = _dest(name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     size = await _write(dest, _iter_body(request))
     log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR), size)
-    return _ok()
+    return _ok(name)
 
 
 async def handle_list(request: web.Request) -> web.Response:
