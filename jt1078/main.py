@@ -12,6 +12,10 @@ LOGGER = logging.getLogger("jt1078")
 MAGIC = b"\x30\x31\x63\x64"
 MAX_PAYLOAD_SIZE = 65535
 AAC_SAMPLE_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000)
+# Bump on every change to handle_status()/publisher_status() so a deploy can
+# be confirmed with `curl -i` (X-JT1078-Version header) instead of guessing
+# from behavior - this is what caught the /media-status prefix-stripping bug.
+STATUS_ENDPOINT_VERSION = "3"
 
 
 def audio_input_options(codec: str, sample_rate: str) -> list[str]:
@@ -474,6 +478,7 @@ async def handle_status(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             f"Content-Length: {len(body)}\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Cache-Control: no-store\r\n"
+            f"X-JT1078-Version: {STATUS_ENDPOINT_VERSION}\r\n"
             "Connection: close\r\n\r\n"
         ).encode() + body)
         await writer.drain()
