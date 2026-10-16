@@ -46,7 +46,9 @@ services:
       - UPLOAD_PORT=10005
       - STORE_DIR=/data/attachments
     volumes:
-      - ./attachments:/data/attachments
+      # Event clips grow without bound; point ATTACHMENTS_DIR (in .env) at a
+      # dedicated volume in production.
+      - ${ATTACHMENTS_DIR:-./attachments}:/data/attachments
 
   # Edge on :80 for media.n-gps.com: MediaMTX WebRTC as before, plus
   # /media-status/ -> jt1078 :10004 /status endpoint and /attachments/ -> upload.
