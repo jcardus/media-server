@@ -25,6 +25,26 @@ def audio_input_options(codec: str, sample_rate: str) -> list[str]:
     return options
 
 
+def audio_codec_for_payload_type(payload_type: int) -> tuple[str, str]:
+    """JT/T 1078's payload-type field is vendor-extended: 19 is Jimi's own
+    extension for AAC (see git history - JT1078_AUDIO_CODEC used to default
+    to "alaw", the standard's own G.711A baseline, until the Jimi cameras
+    needed AAC). A single env var for the whole service can't represent
+    that once a second vendor's cameras share it: an iStartek DC600 reports
+    payload type 6, which got wrapped in a synthetic AAC ADTS header meant
+    for type 19 and fed ffmpeg's AAC decoder nothing but garbage ("Invalid
+    data found", "SBR was found before the first channel element").
+    Fall back to alaw, not aac, for anything that isn't the known Jimi
+    AAC type."""
+    if payload_type == 19:
+        return (
+            os.getenv("JT1078_AUDIO_CODEC", "aac"),
+            os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000"))
+    return (
+        os.getenv("JT1078_AUDIO_CODEC_FALLBACK", "alaw"),
+        os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))
+
+
 def prepare_audio_frame(frame: bytes, codec: str, sample_rate: str, channels: int = 1) -> bytes:
     if codec != "aac" or frame.startswith((b"\xff\xf0", b"\xff\xf1", b"\xff\xf8", b"\xff\xf9")):
         return frame
@@ -76,8 +96,28 @@ class Packet:
 
 
 class PacketParser:
-    def __init__(self):
+    def __init__(self, peer=None):
         self.buffer = bytearray()
+        self.peer = peer
+        self.packets_parsed = 0
+        self.unrecognized_logged = False
+
+    def _log_unrecognized(self):
+        # Bytes that never contain the JT1078 frame magic used to be
+        # discarded in total silence: the receiver logged "camera
+        # connected" and then nothing at all, forever. That is exactly
+        # what a device speaking some *other* framing looks like from the
+        # outside -- a JT/T 808 0x7e message, a vendor handshake, TLS, or
+        # a JT1078 variant with a header we do not parse -- and it is
+        # indistinguishable from a camera that simply sent nothing. Dump
+        # the head of the stream once so a new device model can be
+        # identified from the log instead of guessed at.
+        if self.unrecognized_logged or self.packets_parsed or len(self.buffer) < 16:
+            return
+        self.unrecognized_logged = True
+        LOGGER.warning(
+            "no JT1078 frame magic in first %d bytes peer=%s head=%s",
+            len(self.buffer), self.peer, bytes(self.buffer[:64]).hex())
 
     def feed(self, data: bytes) -> list[Packet]:
         self.buffer.extend(data)
@@ -85,6 +125,7 @@ class PacketParser:
         while True:
             start = self.buffer.find(MAGIC)
             if start < 0:
+                self._log_unrecognized()
                 if len(self.buffer) > len(MAGIC) - 1:
                     del self.buffer[: -(len(MAGIC) - 1)]
                 break
@@ -130,6 +171,7 @@ class PacketParser:
                 payload=bytes(self.buffer[header_size:packet_size]),
             ))
             del self.buffer[:packet_size]
+            self.packets_parsed += 1
         return packets
 
 
@@ -141,8 +183,13 @@ class Publisher:
         self.process = None
         self.audio_input = None
         self.audio_payload_type = None
-        self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
-        self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
+        self.video_payload_type = None
+        # Decided from the first audio packet's payload type (see write()),
+        # not fixed at construction - audio_codec_for_payload_type() is what
+        # tells a Jimi camera's AAC (payload type 19) apart from everything
+        # else, including the DC600's G.711A (payload type 6).
+        self.audio_codec = None
+        self.audio_sample_rate = None
         # Whether to include an audio input in the ffmpeg command. Channels
         # that never send audio must not block video: FFmpeg blocks opening
         # a second -i until it can probe it. A new publisher waits a short
@@ -199,6 +246,13 @@ class Publisher:
         audio_read = None
         audio_write = None
         if self.has_audio:
+            # Normally already set by write()'s first audio packet, which is
+            # the only caller that knows the payload type; fall back to the
+            # same default audio_codec_for_payload_type() uses for an
+            # unrecognized type, for anything that flips has_audio on without
+            # going through write() (tests do this directly).
+            if self.audio_codec is None:
+                self.audio_codec, self.audio_sample_rate = audio_codec_for_payload_type(-1)
             audio_options = audio_input_options(self.audio_codec, self.audio_sample_rate)
             audio_read, audio_write = os.pipe()
             args += [
@@ -295,6 +349,8 @@ class Publisher:
         is_audio = data_type == 3
         if is_audio:
             self.last_audio_at = time.monotonic()
+            if self.audio_codec is None:
+                self.audio_codec, self.audio_sample_rate = audio_codec_for_payload_type(payload_type)
             frame = prepare_audio_frame(frame, self.audio_codec, self.audio_sample_rate)
         else:
             self.last_video_at = time.monotonic()
@@ -363,6 +419,18 @@ class Publisher:
                         self.audio_input.drain(),
                         timeout=float(os.getenv("JT1078_AUDIO_WRITE_TIMEOUT", "2")))
                 else:
+                    if self.video_payload_type != payload_type:
+                        self.video_payload_type = payload_type
+                        # Vendors disagree wildly on this field (the Jimi
+                        # cameras send 96, the standard says 98 for H.264),
+                        # so it is logged next to the codec we actually
+                        # configured rather than used to pick one: a new
+                        # model streaming H.265 into "-f h264" fails in
+                        # ffmpeg with nothing pointing at the cause.
+                        LOGGER.info(
+                            "JT1078 video path=%s payloadType=%d configuredCodec=%s",
+                            self.path, payload_type,
+                            os.getenv("JT1078_VIDEO_CODEC", "h264"))
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()
                 return
@@ -492,7 +560,7 @@ class Connection:
     def __init__(self, peer, namespace: str):
         self.peer = peer
         self.namespace = namespace
-        self.parser = PacketParser()
+        self.parser = PacketParser(peer)
         self.publishers = {}
         self.fragments = {}
         self.last_sequences = {}

@@ -3,8 +3,8 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
-from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_input_options, decode_terminal_id, \
-    prepare_audio_frame
+from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_codec_for_payload_type, \
+    audio_input_options, decode_terminal_id, prepare_audio_frame
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -28,6 +28,17 @@ class PacketParserTest(unittest.TestCase):
             ["-f", "alaw", "-ar", "8000", "-ac", "1"],
             audio_input_options("alaw", "8000"))
 
+    def test_audio_codec_for_payload_type(self):
+        # Payload type 19 is Jimi's own vendor extension for AAC; it is the
+        # only type this codebase has ever confirmed as AAC.
+        self.assertEqual(("aac", "8000"), audio_codec_for_payload_type(19))
+        # Everything else - including an iStartek DC600's payload type 6 -
+        # falls back to alaw, the standard's own G.711A baseline codec and
+        # this project's original default before the Jimi cameras arrived
+        # (see git history), not the Jimi-specific AAC default.
+        self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(6))
+        self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(0))
+
     def test_prepare_audio_frame(self):
         raw = b"\x21\x10\x04\x60"
         framed = prepare_audio_frame(raw, "aac", "8000")
@@ -38,6 +49,39 @@ class PacketParserTest(unittest.TestCase):
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
         self.assertEqual("013345678906", decode_terminal_id(bytes.fromhex("013345678906")))
+        # An iStartek DC600 reports a 12-digit JT/T 808 terminal id rather
+        # than a 15-digit IMEI: it must pass straight through, without the
+        # luhn expansion the Jimi units' packed serial needs. The id this
+        # yields is what appears in the MediaMTX path the frontend opens.
+        self.assertEqual("806076813171", decode_terminal_id(bytes.fromhex("806076813171")))
+
+    def test_logs_a_stream_that_never_shows_the_frame_magic(self):
+        # A device speaking some other framing on the JT1078 port (a JT/T
+        # 808 0x7e message, a vendor handshake) used to be discarded in
+        # silence, indistinguishable from a camera that connected and sent
+        # nothing. The head of the stream has to reach the log.
+        parser = PacketParser(("1.2.3.4", 5))
+        with self.assertLogs(main.LOGGER, level="WARNING") as logs:
+            self.assertEqual([], parser.feed(b"\x7e\x02\x00" + bytes(30)))
+        self.assertIn("no JT1078 frame magic", logs.output[0])
+        self.assertIn("7e0200", logs.output[0])
+        self.assertIn("1.2.3.4", logs.output[0])
+        # Once per connection, however long the device keeps talking.
+        self.assertEqual([], parser.feed(bytes(64)))
+        self.assertEqual(1, len(logs.output))
+
+    def test_stays_quiet_on_a_short_read_and_on_a_valid_stream(self):
+        # A camera's first read can be a couple of bytes, and a valid
+        # stream's tail is a partial packet on nearly every read; neither
+        # is an unrecognized protocol.
+        parser = PacketParser()
+        parser.feed(MAGIC[:2])
+        self.assertFalse(parser.unrecognized_logged)
+
+        parser = PacketParser()
+        self.assertEqual(1, len(parser.feed(packet(b"\x00\x00\x00\x01\x67\x64"))))
+        parser.feed(b"\x11" * 32)
+        self.assertFalse(parser.unrecognized_logged)
 
     def test_fragmented_network_input(self):
         data = packet(b"\x00\x00\x00\x01\x67\x64")
@@ -77,6 +121,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         publisher = Publisher("860112070346616", 1, "live")
         with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
             publisher.has_audio = True
+            publisher.audio_codec = "aac"
+            publisher.audio_sample_rate = "8000"
             await publisher.start()
         args = create.call_args.args
         self.assertNotIn("-an", args)
@@ -98,6 +144,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         # from the wall clock so both streams share a real-time pace.
         publisher = Publisher("860112070346616", 1, "live")
         publisher.has_audio = True
+        publisher.audio_codec = "aac"
+        publisher.audio_sample_rate = "8000"
         with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
             await publisher.start()
         args = create.call_args.args
@@ -106,6 +154,31 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("-bsf:v", args)
         self.assertFalse(any("setts" in str(a) for a in args))
         publisher.audio_input.close()
+
+    async def test_picks_audio_codec_from_the_first_audio_packets_payload_type(self):
+        # A non-Jimi camera reporting a payload type other than 19 must not
+        # be fed through the AAC ADTS framer meant for Jimi's audio -- that
+        # produces bytes an AAC decoder reads as valid-looking garbage
+        # (confirmed against production ffmpeg logs for payload type 6).
+        publisher = Publisher("806076813171", 1, "live")
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+
+        async def fake_start():
+            publisher.process = process
+            publisher.audio_input = MagicMock()
+            publisher.audio_input.drain = AsyncMock()
+
+        with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)):
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=96)
+            await publisher.write(b"g711a-frame", data_type=3, payload_type=6)
+
+        self.assertEqual("alaw", publisher.audio_codec)
+        # Unlike AAC, alaw is never ADTS-framed -- the raw frame must reach
+        # ffmpeg unchanged.
+        publisher.audio_input.write.assert_called_once_with(b"g711a-frame")
 
     async def test_buffers_video_until_audio_arrives_then_commits_once(self):
         publisher = Publisher("860112070346616", 1, "live")
@@ -144,6 +217,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         publisher = Publisher("860112070346616", 1, "live")
         publisher.decided = True
         publisher.has_audio = True
+        publisher.audio_codec = "aac"
+        publisher.audio_sample_rate = "8000"
 
         stalled_process = MagicMock()
         stalled_process.returncode = None
@@ -179,6 +254,27 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         stalled_process.terminate.assert_called_once()
         self.assertIs(publisher.process, healthy_process)
         healthy_audio_input.write.assert_called_once()
+
+    async def test_logs_the_reported_video_payload_type_once(self):
+        # A camera streaming H.265 into "-f h264" fails deep inside ffmpeg
+        # with nothing pointing at the codec as the cause, so the type the
+        # camera reports has to appear next to the one we configured.
+        publisher = Publisher("806076813171", 1, "live")
+        publisher.decided = True
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+        publisher.process = process
+
+        with self.assertLogs(main.LOGGER, level="INFO") as logs:
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=99)
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=99)
+
+        lines = [line for line in logs.output if "JT1078 video" in line]
+        self.assertEqual(1, len(lines))
+        self.assertIn("payloadType=99", lines[0])
+        self.assertIn("configuredCodec=h264", lines[0])
 
     async def test_commits_video_only_after_grace_period(self):
         publisher = Publisher("860112070346616", 1, "live")

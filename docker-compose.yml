@@ -19,6 +19,16 @@ services:
       - JT1078_AUDIO_CODEC=aac
       - JT1078_AUDIO_SAMPLE_RATE=8000
       - FFMPEG_LOG_LEVEL=verbose
+    # verbose ffmpeg output across ~15 live streams writes a per-frame line
+    # twice a second: this container's json log had reached 6 GB (on a 38 GB
+    # root disk) and a single grep through it takes minutes, which is a
+    # problem precisely when a new camera's first connection is what has to
+    # be found in it. Keep the verbosity, bound the history.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
