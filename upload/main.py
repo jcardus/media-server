@@ -39,6 +39,20 @@ ALLOWED_EXT = {".mp4", ".h264", ".jpg", ".jpeg", ".png"}
 SIGN_SECRET = os.getenv("SIGN_SECRET", "jimidvr@123!443")
 STRICT_SIGN = os.getenv("STRICT_SIGN", "") not in ("", "0", "false")
 
+# Some firmware families (the 8654078… cameras, and anything else sharing that
+# ODM lineage) add a `callbackBody` JSON field to every upload carrying where
+# and when the alarm happened. It used to be read and dropped. These are the
+# event-level keys worth keeping: they are the only source of an event position
+# we have, since this Traccar instance cannot return historical alarm positions
+# (see handle_events). Whitelisted rather than merged wholesale so a camera
+# field can never collide with Traccar's own type/alarm/level/time/kind.
+CALLBACK_EVENT_FIELDS = (
+    "lat", "lng", "alarmTime", "camera", "eventType", "videoBegin", "videoEnd")
+# Form fields are truncated for logging; callbackBody needs room to stay
+# parseable as JSON.
+FIELD_LIMIT = 256
+CALLBACK_FIELD_LIMIT = 4096
+
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 # The camera's `filename` form field: <imei>_<alarmLabel(32 hex)>_<channel>_<seq>.<ext>
 FILENAME_FIELD = re.compile(r"^(\d{10,17})_([0-9A-Fa-f]{8,64})_")
@@ -88,6 +102,57 @@ def _dest(stored_name):
     return STORE_DIR / "_unsorted" / stored_name
 
 
+def _merge_meta(folder: Path, data: dict, overwrite: bool) -> dict:
+    """Fold `data` into folder/.meta.json instead of replacing it.
+
+    An event's metadata arrives from two independent sources in no
+    guaranteed order -- Traccar's POST /event (which decodes the alarm
+    type) and the camera's own callbackBody (which carries the position).
+    A plain write_text() from either one silently erased the other's half.
+    `overwrite` marks Traccar as authoritative for the keys it sends,
+    while the camera's per-file values are first-writer-wins so the
+    earliest file in an event sets the position.
+    """
+    path = folder / ".meta.json"
+    meta = {}
+    if path.is_file():
+        try:
+            meta = json.loads(path.read_text())
+        except Exception:
+            log.warning("unreadable .meta.json at %s, rewriting", folder)
+    for key, value in data.items():
+        if value is None:
+            continue
+        if overwrite or key not in meta:
+            meta[key] = value
+    folder.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta))
+    return meta
+
+
+def _callback_event_meta(raw: str) -> dict:
+    """The event-level fields out of the camera's `callbackBody` JSON."""
+    try:
+        body = json.loads(raw)
+    except Exception:
+        log.warning("unparseable callbackBody: %.120r", raw)
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    meta = {}
+    for key in CALLBACK_EVENT_FIELDS:
+        value = body.get(key)
+        if value is None:
+            continue
+        if key in ("lat", "lng"):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                pass
+        meta[key] = value
+    return meta
+
+
 def _ok(filename):
     # dvr-upload's exact success body - anything else and the camera reports
     # UPLOADFILEFAIL and re-POSTs every ~5 min.
@@ -131,8 +196,13 @@ async def handle_upload(request: web.Request) -> web.Response:
             pending = STORE_DIR / "_pending" / (uuid4().hex + suffix)
             await _write(pending, _iter_part(part))
         else:
-            fields[part.name] = (await part.text())[:256]
-    log.info("  fields=%s pending=%s", fields, bool(pending))
+            limit = CALLBACK_FIELD_LIMIT if part.name == "callbackBody" else FIELD_LIMIT
+            fields[part.name] = (await part.text())[:limit]
+    # callbackBody is kept in full for _callback_event_meta but shortened
+    # here: these logs are already the noisiest thing on the box.
+    log.info("  fields=%s pending=%s", {
+        key: (value[:120] + "…" if len(value) > 120 else value)
+        for key, value in fields.items()}, bool(pending))
 
     if pending is None or not pending.exists():
         return _fail("The file content is empty", 400)
@@ -156,6 +226,10 @@ async def handle_upload(request: web.Request) -> web.Response:
     dest.parent.mkdir(parents=True, exist_ok=True)
     pending.replace(dest)
     log.info("stored %s (%d bytes)", dest.relative_to(STORE_DIR).as_posix(), dest.stat().st_size)
+    if fields.get("callbackBody"):
+        meta = _callback_event_meta(fields["callbackBody"])
+        if meta:
+            _merge_meta(dest.parent, meta, overwrite=False)
     return _ok(name_field)
 
 
@@ -238,9 +312,8 @@ async def handle_event_meta(request: web.Request) -> web.Response:
     if not imei or not identifier:
         return _fail("imei and identifier required", 400)
     folder = STORE_DIR / imei / identifier
-    folder.mkdir(parents=True, exist_ok=True)
     meta = {k: body[k] for k in ("type", "alarm", "level", "time", "kind") if body.get(k) is not None}
-    (folder / ".meta.json").write_text(json.dumps(meta))
+    meta = _merge_meta(folder, meta, overwrite=True)
     log.info("event meta %s/%s %s", imei, identifier, meta)
     resp = _ok(identifier)
     resp.force_close()

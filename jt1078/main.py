@@ -76,8 +76,28 @@ class Packet:
 
 
 class PacketParser:
-    def __init__(self):
+    def __init__(self, peer=None):
         self.buffer = bytearray()
+        self.peer = peer
+        self.packets_parsed = 0
+        self.unrecognized_logged = False
+
+    def _log_unrecognized(self):
+        # Bytes that never contain the JT1078 frame magic used to be
+        # discarded in total silence: the receiver logged "camera
+        # connected" and then nothing at all, forever. That is exactly
+        # what a device speaking some *other* framing looks like from the
+        # outside -- a JT/T 808 0x7e message, a vendor handshake, TLS, or
+        # a JT1078 variant with a header we do not parse -- and it is
+        # indistinguishable from a camera that simply sent nothing. Dump
+        # the head of the stream once so a new device model can be
+        # identified from the log instead of guessed at.
+        if self.unrecognized_logged or self.packets_parsed or len(self.buffer) < 16:
+            return
+        self.unrecognized_logged = True
+        LOGGER.warning(
+            "no JT1078 frame magic in first %d bytes peer=%s head=%s",
+            len(self.buffer), self.peer, bytes(self.buffer[:64]).hex())
 
     def feed(self, data: bytes) -> list[Packet]:
         self.buffer.extend(data)
@@ -85,6 +105,7 @@ class PacketParser:
         while True:
             start = self.buffer.find(MAGIC)
             if start < 0:
+                self._log_unrecognized()
                 if len(self.buffer) > len(MAGIC) - 1:
                     del self.buffer[: -(len(MAGIC) - 1)]
                 break
@@ -130,6 +151,7 @@ class PacketParser:
                 payload=bytes(self.buffer[header_size:packet_size]),
             ))
             del self.buffer[:packet_size]
+            self.packets_parsed += 1
         return packets
 
 
@@ -141,6 +163,7 @@ class Publisher:
         self.process = None
         self.audio_input = None
         self.audio_payload_type = None
+        self.video_payload_type = None
         self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
         self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
         # Whether to include an audio input in the ffmpeg command. Channels
@@ -363,6 +386,18 @@ class Publisher:
                         self.audio_input.drain(),
                         timeout=float(os.getenv("JT1078_AUDIO_WRITE_TIMEOUT", "2")))
                 else:
+                    if self.video_payload_type != payload_type:
+                        self.video_payload_type = payload_type
+                        # Vendors disagree wildly on this field (the Jimi
+                        # cameras send 96, the standard says 98 for H.264),
+                        # so it is logged next to the codec we actually
+                        # configured rather than used to pick one: a new
+                        # model streaming H.265 into "-f h264" fails in
+                        # ffmpeg with nothing pointing at the cause.
+                        LOGGER.info(
+                            "JT1078 video path=%s payloadType=%d configuredCodec=%s",
+                            self.path, payload_type,
+                            os.getenv("JT1078_VIDEO_CODEC", "h264"))
                     self.process.stdin.write(frame)
                     await self.process.stdin.drain()
                 return
@@ -492,7 +527,7 @@ class Connection:
     def __init__(self, peer, namespace: str):
         self.peer = peer
         self.namespace = namespace
-        self.parser = PacketParser()
+        self.parser = PacketParser(peer)
         self.publishers = {}
         self.fragments = {}
         self.last_sequences = {}

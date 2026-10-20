@@ -38,6 +38,39 @@ class PacketParserTest(unittest.TestCase):
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
         self.assertEqual("013345678906", decode_terminal_id(bytes.fromhex("013345678906")))
+        # An iStartek DC600 reports a 12-digit JT/T 808 terminal id rather
+        # than a 15-digit IMEI: it must pass straight through, without the
+        # luhn expansion the Jimi units' packed serial needs. The id this
+        # yields is what appears in the MediaMTX path the frontend opens.
+        self.assertEqual("806076813171", decode_terminal_id(bytes.fromhex("806076813171")))
+
+    def test_logs_a_stream_that_never_shows_the_frame_magic(self):
+        # A device speaking some other framing on the JT1078 port (a JT/T
+        # 808 0x7e message, a vendor handshake) used to be discarded in
+        # silence, indistinguishable from a camera that connected and sent
+        # nothing. The head of the stream has to reach the log.
+        parser = PacketParser(("1.2.3.4", 5))
+        with self.assertLogs(main.LOGGER, level="WARNING") as logs:
+            self.assertEqual([], parser.feed(b"\x7e\x02\x00" + bytes(30)))
+        self.assertIn("no JT1078 frame magic", logs.output[0])
+        self.assertIn("7e0200", logs.output[0])
+        self.assertIn("1.2.3.4", logs.output[0])
+        # Once per connection, however long the device keeps talking.
+        self.assertEqual([], parser.feed(bytes(64)))
+        self.assertEqual(1, len(logs.output))
+
+    def test_stays_quiet_on_a_short_read_and_on_a_valid_stream(self):
+        # A camera's first read can be a couple of bytes, and a valid
+        # stream's tail is a partial packet on nearly every read; neither
+        # is an unrecognized protocol.
+        parser = PacketParser()
+        parser.feed(MAGIC[:2])
+        self.assertFalse(parser.unrecognized_logged)
+
+        parser = PacketParser()
+        self.assertEqual(1, len(parser.feed(packet(b"\x00\x00\x00\x01\x67\x64"))))
+        parser.feed(b"\x11" * 32)
+        self.assertFalse(parser.unrecognized_logged)
 
     def test_fragmented_network_input(self):
         data = packet(b"\x00\x00\x00\x01\x67\x64")
@@ -179,6 +212,27 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         stalled_process.terminate.assert_called_once()
         self.assertIs(publisher.process, healthy_process)
         healthy_audio_input.write.assert_called_once()
+
+    async def test_logs_the_reported_video_payload_type_once(self):
+        # A camera streaming H.265 into "-f h264" fails deep inside ffmpeg
+        # with nothing pointing at the codec as the cause, so the type the
+        # camera reports has to appear next to the one we configured.
+        publisher = Publisher("806076813171", 1, "live")
+        publisher.decided = True
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+        publisher.process = process
+
+        with self.assertLogs(main.LOGGER, level="INFO") as logs:
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=99)
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=99)
+
+        lines = [line for line in logs.output if "JT1078 video" in line]
+        self.assertEqual(1, len(lines))
+        self.assertIn("payloadType=99", lines[0])
+        self.assertIn("configuredCodec=h264", lines[0])
 
     async def test_commits_video_only_after_grace_period(self):
         publisher = Publisher("860112070346616", 1, "live")
