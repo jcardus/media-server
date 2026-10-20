@@ -25,6 +25,26 @@ def audio_input_options(codec: str, sample_rate: str) -> list[str]:
     return options
 
 
+def audio_codec_for_payload_type(payload_type: int) -> tuple[str, str]:
+    """JT/T 1078's payload-type field is vendor-extended: 19 is Jimi's own
+    extension for AAC (see git history - JT1078_AUDIO_CODEC used to default
+    to "alaw", the standard's own G.711A baseline, until the Jimi cameras
+    needed AAC). A single env var for the whole service can't represent
+    that once a second vendor's cameras share it: an iStartek DC600 reports
+    payload type 6, which got wrapped in a synthetic AAC ADTS header meant
+    for type 19 and fed ffmpeg's AAC decoder nothing but garbage ("Invalid
+    data found", "SBR was found before the first channel element").
+    Fall back to alaw, not aac, for anything that isn't the known Jimi
+    AAC type."""
+    if payload_type == 19:
+        return (
+            os.getenv("JT1078_AUDIO_CODEC", "aac"),
+            os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000"))
+    return (
+        os.getenv("JT1078_AUDIO_CODEC_FALLBACK", "alaw"),
+        os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))
+
+
 def prepare_audio_frame(frame: bytes, codec: str, sample_rate: str, channels: int = 1) -> bytes:
     if codec != "aac" or frame.startswith((b"\xff\xf0", b"\xff\xf1", b"\xff\xf8", b"\xff\xf9")):
         return frame
@@ -164,8 +184,12 @@ class Publisher:
         self.audio_input = None
         self.audio_payload_type = None
         self.video_payload_type = None
-        self.audio_codec = os.getenv("JT1078_AUDIO_CODEC", "aac")
-        self.audio_sample_rate = os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000")
+        # Decided from the first audio packet's payload type (see write()),
+        # not fixed at construction - audio_codec_for_payload_type() is what
+        # tells a Jimi camera's AAC (payload type 19) apart from everything
+        # else, including the DC600's G.711A (payload type 6).
+        self.audio_codec = None
+        self.audio_sample_rate = None
         # Whether to include an audio input in the ffmpeg command. Channels
         # that never send audio must not block video: FFmpeg blocks opening
         # a second -i until it can probe it. A new publisher waits a short
@@ -222,6 +246,13 @@ class Publisher:
         audio_read = None
         audio_write = None
         if self.has_audio:
+            # Normally already set by write()'s first audio packet, which is
+            # the only caller that knows the payload type; fall back to the
+            # same default audio_codec_for_payload_type() uses for an
+            # unrecognized type, for anything that flips has_audio on without
+            # going through write() (tests do this directly).
+            if self.audio_codec is None:
+                self.audio_codec, self.audio_sample_rate = audio_codec_for_payload_type(-1)
             audio_options = audio_input_options(self.audio_codec, self.audio_sample_rate)
             audio_read, audio_write = os.pipe()
             args += [
@@ -318,6 +349,8 @@ class Publisher:
         is_audio = data_type == 3
         if is_audio:
             self.last_audio_at = time.monotonic()
+            if self.audio_codec is None:
+                self.audio_codec, self.audio_sample_rate = audio_codec_for_payload_type(payload_type)
             frame = prepare_audio_frame(frame, self.audio_codec, self.audio_sample_rate)
         else:
             self.last_video_at = time.monotonic()

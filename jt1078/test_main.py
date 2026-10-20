@@ -3,8 +3,8 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
-from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_input_options, decode_terminal_id, \
-    prepare_audio_frame
+from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_codec_for_payload_type, \
+    audio_input_options, decode_terminal_id, prepare_audio_frame
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -27,6 +27,17 @@ class PacketParserTest(unittest.TestCase):
         self.assertEqual(
             ["-f", "alaw", "-ar", "8000", "-ac", "1"],
             audio_input_options("alaw", "8000"))
+
+    def test_audio_codec_for_payload_type(self):
+        # Payload type 19 is Jimi's own vendor extension for AAC; it is the
+        # only type this codebase has ever confirmed as AAC.
+        self.assertEqual(("aac", "8000"), audio_codec_for_payload_type(19))
+        # Everything else - including an iStartek DC600's payload type 6 -
+        # falls back to alaw, the standard's own G.711A baseline codec and
+        # this project's original default before the Jimi cameras arrived
+        # (see git history), not the Jimi-specific AAC default.
+        self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(6))
+        self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(0))
 
     def test_prepare_audio_frame(self):
         raw = b"\x21\x10\x04\x60"
@@ -110,6 +121,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         publisher = Publisher("860112070346616", 1, "live")
         with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
             publisher.has_audio = True
+            publisher.audio_codec = "aac"
+            publisher.audio_sample_rate = "8000"
             await publisher.start()
         args = create.call_args.args
         self.assertNotIn("-an", args)
@@ -131,6 +144,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         # from the wall clock so both streams share a real-time pace.
         publisher = Publisher("860112070346616", 1, "live")
         publisher.has_audio = True
+        publisher.audio_codec = "aac"
+        publisher.audio_sample_rate = "8000"
         with patch("main.asyncio.create_subprocess_exec", new=AsyncMock()) as create:
             await publisher.start()
         args = create.call_args.args
@@ -139,6 +154,31 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("-bsf:v", args)
         self.assertFalse(any("setts" in str(a) for a in args))
         publisher.audio_input.close()
+
+    async def test_picks_audio_codec_from_the_first_audio_packets_payload_type(self):
+        # A non-Jimi camera reporting a payload type other than 19 must not
+        # be fed through the AAC ADTS framer meant for Jimi's audio -- that
+        # produces bytes an AAC decoder reads as valid-looking garbage
+        # (confirmed against production ffmpeg logs for payload type 6).
+        publisher = Publisher("806076813171", 1, "live")
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.drain = AsyncMock()
+
+        async def fake_start():
+            publisher.process = process
+            publisher.audio_input = MagicMock()
+            publisher.audio_input.drain = AsyncMock()
+
+        with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)):
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=96)
+            await publisher.write(b"g711a-frame", data_type=3, payload_type=6)
+
+        self.assertEqual("alaw", publisher.audio_codec)
+        # Unlike AAC, alaw is never ADTS-framed -- the raw frame must reach
+        # ffmpeg unchanged.
+        publisher.audio_input.write.assert_called_once_with(b"g711a-frame")
 
     async def test_buffers_video_until_audio_arrives_then_commits_once(self):
         publisher = Publisher("860112070346616", 1, "live")
@@ -177,6 +217,8 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         publisher = Publisher("860112070346616", 1, "live")
         publisher.decided = True
         publisher.has_audio = True
+        publisher.audio_codec = "aac"
+        publisher.audio_sample_rate = "8000"
 
         stalled_process = MagicMock()
         stalled_process.returncode = None
