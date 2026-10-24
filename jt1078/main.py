@@ -210,6 +210,11 @@ class Publisher:
         self.last_video_at = None
         self.last_audio_at = None
         self.restart_count = 0
+        # Set once this publisher is evicted or its connection ends. A
+        # coroutine still stuck in a write when that happens wakes up with
+        # a broken pipe, and its retry must not spawn a fresh ffmpeg on
+        # the path the replacing connection is about to publish to.
+        self.closed = False
 
     async def start(self):
         if self.started_at is not None:
@@ -375,7 +380,7 @@ class Publisher:
             self.has_audio = True
             if self.process is not None and self.process.returncode is None:
                 LOGGER.info("audio detected, restarting publisher path=%s", self.path)
-                await self.close()
+                await self.close(final=False)
 
         await self._deliver(frame, data_type, payload_type)
 
@@ -384,7 +389,7 @@ class Publisher:
         self.grace_task = asyncio.ensure_future(self._commit())
 
     async def _commit(self):
-        if self.decided:
+        if self.decided or self.closed:
             return
         self.decided = True
         pending, self.pending = self.pending, []
@@ -395,6 +400,8 @@ class Publisher:
     async def _deliver(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
         for attempt in range(2):
+            if self.closed:
+                return
             if self.process is None or self.process.returncode is not None:
                 if self.process is not None:
                     LOGGER.warning(
@@ -432,10 +439,20 @@ class Publisher:
                             self.path, payload_type,
                             os.getenv("JT1078_VIDEO_CODEC", "h264"))
                     self.process.stdin.write(frame)
-                    await self.process.stdin.drain()
+                    # Same stall as audio above, on the video pipe. Left
+                    # unbounded, it hangs the packet loop outside the read
+                    # timeout, so the camera's socket is never released and
+                    # /status keeps reporting the session as live. Larger
+                    # default than audio: one I-frame can fill the pipe on
+                    # its own, and ffmpeg's startup probe holds back reads.
+                    await asyncio.wait_for(
+                        self.process.stdin.drain(),
+                        timeout=float(os.getenv("JT1078_VIDEO_WRITE_TIMEOUT", "5")))
                 return
             except asyncio.TimeoutError:
-                LOGGER.warning("publisher audio write stalled, restarting path=%s", self.path)
+                LOGGER.warning(
+                    "publisher %s write stalled, restarting path=%s",
+                    "audio" if is_audio else "video", self.path)
                 self.process.terminate()
                 try:
                     await asyncio.wait_for(self.process.wait(), timeout=5)
@@ -453,7 +470,9 @@ class Publisher:
                 if attempt:
                     raise
 
-    async def close(self):
+    async def close(self, final=True):
+        if final:
+            self.closed = True
         if self.grace_handle is not None:
             self.grace_handle.cancel()
             self.grace_handle = None
