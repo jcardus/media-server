@@ -1,3 +1,20 @@
+# All containers ship stdout/stderr to CloudWatch Logs, one stream per
+# container in a single group. The host is not on AWS, so dockerd itself needs
+# credentials, and it runs without HOME: the systemd drop-in
+# /etc/systemd/system/docker.service.d/aws-credentials.conf sets
+# AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials. non-blocking keeps a CloudWatch
+# outage from stalling the services; docker's local cache keeps `docker logs`
+# working.
+x-cloudwatch: &cloudwatch
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION:-us-east-1}
+    awslogs-group: ${CLOUDWATCH_LOG_GROUP:-media-server}
+    awslogs-create-group: "true"
+    tag: "{{.Name}}"
+    mode: non-blocking
+    max-buffer-size: 4m
+
 services:
   jt1078:
     build: ./jt1078
@@ -20,15 +37,10 @@ services:
       - JT1078_AUDIO_SAMPLE_RATE=8000
       - FFMPEG_LOG_LEVEL=verbose
     # verbose ffmpeg output across ~15 live streams writes a per-frame line
-    # twice a second: this container's json log had reached 6 GB (on a 38 GB
-    # root disk) and a single grep through it takes minutes, which is a
-    # problem precisely when a new camera's first connection is what has to
-    # be found in it. Keep the verbosity, bound the history.
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
+    # twice a second (this container's json log once reached 6 GB), so this
+    # is by far the largest CloudWatch stream: lower FFMPEG_LOG_LEVEL if
+    # ingestion cost matters more than the detail.
+    logging: *cloudwatch
 
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
@@ -42,6 +54,7 @@ services:
       - ./recordings:/recordings
     environment:
       - MTX_LOGLEVEL=info
+    logging: *cloudwatch
 
   # Event-attachment sink: JT/T 808 dashcams POST /upload here (direct, plain
   # HTTP to host:10005) after a VIDEOUPLOAD command; files served back for the
@@ -59,6 +72,7 @@ services:
       # Event clips grow without bound; point ATTACHMENTS_DIR (in .env) at a
       # dedicated volume in production.
       - ${ATTACHMENTS_DIR:-./attachments}:/data/attachments
+    logging: *cloudwatch
 
   # Edge on :80 for media.n-gps.com: MediaMTX WebRTC as before, plus
   # /media-status/ -> jt1078 :10004 /status endpoint and /attachments/ -> upload.
@@ -74,3 +88,4 @@ services:
       - "80:80"       # WebRTC — browsers open https://media.n-gps.com/... (Cloudflare-proxied)
     volumes:
       - ./nginx/media-edge.conf:/etc/nginx/conf.d/default.conf:ro
+    logging: *cloudwatch
