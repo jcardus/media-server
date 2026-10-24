@@ -255,6 +255,89 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(publisher.process, healthy_process)
         healthy_audio_input.write.assert_called_once()
 
+    async def test_restarts_publisher_when_video_write_stalls(self):
+        # An unbounded video drain hangs the packet loop outside the read
+        # timeout, so the camera's socket is never released.
+        publisher = Publisher("806076813171", 2, "playback")
+        publisher.decided = True
+
+        async def hang():
+            await asyncio.sleep(3600)
+
+        stalled_process = MagicMock()
+        stalled_process.returncode = None
+        stalled_process.terminate = MagicMock()
+        stalled_process.wait = AsyncMock(return_value=None)
+        stalled_process.stdin = MagicMock()
+        stalled_process.stdin.drain = AsyncMock(side_effect=hang)
+
+        healthy_process = MagicMock()
+        healthy_process.returncode = None
+        healthy_process.stdin = MagicMock()
+        healthy_process.stdin.drain = AsyncMock()
+
+        async def fake_start():
+            publisher.process = healthy_process
+
+        publisher.process = stalled_process
+        with patch.dict("os.environ", {"JT1078_VIDEO_WRITE_TIMEOUT": "0.01"}):
+            with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)):
+                with self.assertLogs(main.LOGGER, level="WARNING") as logs:
+                    await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=98)
+
+        stalled_process.terminate.assert_called_once()
+        self.assertIs(publisher.process, healthy_process)
+        healthy_process.stdin.write.assert_called_once_with(b"\x00\x00\x00\x01video")
+        self.assertTrue(any("video write stalled" in line for line in logs.output))
+
+    async def test_closed_publisher_does_not_respawn_ffmpeg(self):
+        # An evicted publisher whose write then fails with a broken pipe
+        # must not start a new ffmpeg on the path the replacing
+        # connection is taking over.
+        publisher = Publisher("806076813171", 2, "playback")
+        publisher.decided = True
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.wait = AsyncMock(return_value=None)
+        publisher.process = process
+
+        async def evicted_mid_write():
+            await publisher.close()
+            raise BrokenPipeError
+
+        process.stdin.drain = AsyncMock(side_effect=evicted_mid_write)
+        with patch.object(Publisher, "start", new=AsyncMock()) as start:
+            await publisher.write(b"\x00\x00\x00\x01video", data_type=0, payload_type=98)
+
+        self.assertTrue(publisher.closed)
+        start.assert_not_called()
+
+    async def test_audio_restart_in_place_does_not_mark_publisher_closed(self):
+        publisher = Publisher("806076813171", 1, "live")
+        publisher.decided = True
+        old_process = MagicMock(returncode=None)
+        old_process.stdin = MagicMock()
+
+        async def exits():
+            old_process.returncode = 0
+
+        old_process.wait = AsyncMock(side_effect=exits)
+        publisher.process = old_process
+
+        async def fake_start():
+            publisher.process = MagicMock(returncode=None)
+            publisher.process.stdin = MagicMock()
+            publisher.audio_input = MagicMock()
+            publisher.audio_input.drain = AsyncMock()
+
+        with patch.object(Publisher, "start", new=AsyncMock(side_effect=fake_start)) as start:
+            await publisher.write(b"audio", data_type=3, payload_type=6)
+
+        self.assertFalse(publisher.closed)
+        start.assert_called_once()
+        publisher.audio_input.write.assert_called_once()
+
     async def test_logs_the_reported_video_payload_type_once(self):
         # A camera streaming H.265 into "-f h264" fails deep inside ffmpeg
         # with nothing pointing at the codec as the cause, so the type the
