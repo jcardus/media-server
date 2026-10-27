@@ -26,10 +26,14 @@ services:
       - "10002:10002"
       - "10003:10003"
       - "10004:10004"
+      # Active-safety alarm attachments (0x1210/0x1211/0x1212 after a 0x9208);
+      # point Traccar's huabao.activeSafetyPort here.
+      - "10006:10006"
     environment:
       - JT1078_LIVE_PORT=10002
       - JT1078_PLAYBACK_PORT=10003
       - JT1078_STATUS_PORT=10004
+      - JT1078_ATTACHMENT_PORT=10006
       - JT1078_CHANNEL_OFFSET=1
       - JT1078_VIDEO_CODEC=h264
       # JT/T 1078 payload type 19 reported by the camera is AAC.

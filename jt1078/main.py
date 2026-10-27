@@ -665,10 +665,173 @@ async def handle_connection(
         LOGGER.info("camera disconnected peer=%s namespace=%s", peer, namespace)
 
 
+# Active-safety (T/JSATL12) alarm attachment upload. After a 0x9208 the
+# terminal (e.g. iStartek DC600) connects here and sends 0x7e-framed JT/T
+# 808 messages - 0x1210 attachment list, 0x1211 file info, 0x1212 upload
+# finished - interleaved with file-data packets that reuse the JT1078
+# 0x30316364 magic but carry a different header (50-byte file name, offset,
+# length). That is why this is not served on the playback port: PacketParser
+# would misread the data packets as video. For now this only acks 0x1210 and
+# 0x1211, logs every message body in full and counts file bytes, so the real
+# file names, sizes and data flow can be seen before files are stored.
+ATTACHMENT_FILE_NAME_SIZE = 50
+ATTACHMENT_DATA_HEADER_SIZE = len(MAGIC) + ATTACHMENT_FILE_NAME_SIZE + 8
+ATTACHMENT_ACKED_MESSAGES = (0x1210, 0x1211)
+
+
+def jt808_unescape(data: bytes) -> bytes:
+    return data.replace(b"\x7d\x02", b"\x7e").replace(b"\x7d\x01", b"\x7d")
+
+
+def jt808_escape(data: bytes) -> bytes:
+    return data.replace(b"\x7d", b"\x7d\x01").replace(b"\x7e", b"\x7d\x02")
+
+
+def jt808_checksum(data: bytes) -> int:
+    checksum = 0
+    for byte in data:
+        checksum ^= byte
+    return checksum
+
+
+@dataclass
+class Jt808Message:
+    message_id: int
+    serial: int
+    terminal: bytes
+    version: int | None
+    body: bytes
+
+
+def parse_jt808(frame: bytes) -> Jt808Message | None:
+    """Parse one unescaped JT/T 808 frame (without the 0x7e delimiters)."""
+    if len(frame) < 13 or jt808_checksum(frame[:-1]) != frame[-1]:
+        return None
+    message_id = int.from_bytes(frame[0:2], "big")
+    attributes = int.from_bytes(frame[2:4], "big")
+    offset = 4
+    version = None
+    if attributes & 0x4000:
+        version = frame[offset]
+        terminal = frame[offset + 1:offset + 11]
+        offset += 11
+    else:
+        terminal = frame[offset:offset + 6]
+        offset += 6
+    serial = int.from_bytes(frame[offset:offset + 2], "big")
+    offset += 2
+    if attributes & 0x2000:
+        offset += 4
+    body = frame[offset:offset + (attributes & 0x03FF)]
+    return Jt808Message(message_id, serial, terminal, version, body)
+
+
+def build_jt808(message_id: int, serial: int, terminal: bytes, version: int | None, body: bytes) -> bytes:
+    attributes = len(body)
+    header = bytearray(message_id.to_bytes(2, "big"))
+    if version is not None:
+        header.extend((attributes | 0x4000).to_bytes(2, "big"))
+        header.append(version)
+    else:
+        header.extend(attributes.to_bytes(2, "big"))
+    header.extend(terminal)
+    header.extend(serial.to_bytes(2, "big"))
+    frame = bytes(header) + body
+    return b"\x7e" + jt808_escape(frame + bytes((jt808_checksum(frame),))) + b"\x7e"
+
+
+def general_response(message: Jt808Message, serial: int) -> bytes:
+    body = message.serial.to_bytes(2, "big") + message.message_id.to_bytes(2, "big") + b"\x00"
+    return build_jt808(0x8001, serial, message.terminal, message.version, body)
+
+
+class AttachmentParser:
+    """Split an attachment-upload stream into JT/T 808 frames and file-data packets."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def feed(self, data: bytes) -> list:
+        self.buffer.extend(data)
+        items = []
+        while self.buffer:
+            if self.buffer[0] == 0x7e:
+                end = self.buffer.find(b"\x7e", 1)
+                if end < 0:
+                    break
+                if end == 1:
+                    # Back-to-back delimiters: the second one opens the next frame.
+                    del self.buffer[:1]
+                    continue
+                items.append(("message", jt808_unescape(bytes(self.buffer[1:end]))))
+                del self.buffer[:end + 1]
+            elif self.buffer[:len(MAGIC)] == MAGIC[:len(self.buffer)]:
+                if len(self.buffer) < ATTACHMENT_DATA_HEADER_SIZE:
+                    break
+                name_end = len(MAGIC) + ATTACHMENT_FILE_NAME_SIZE
+                name = bytes(self.buffer[len(MAGIC):name_end]).rstrip(b"\x00").decode("ascii", "replace")
+                data_offset = int.from_bytes(self.buffer[name_end:name_end + 4], "big")
+                length = int.from_bytes(self.buffer[name_end + 4:name_end + 8], "big")
+                if len(self.buffer) < ATTACHMENT_DATA_HEADER_SIZE + length:
+                    break
+                items.append(("data", name, data_offset, length))
+                del self.buffer[:ATTACHMENT_DATA_HEADER_SIZE + length]
+            else:
+                start = min((i for i in (self.buffer.find(b"\x7e"), self.buffer.find(MAGIC)) if i >= 0), default=-1)
+                LOGGER.warning("attachment stream: skipping %d unrecognized bytes head=%s",
+                               len(self.buffer) if start < 0 else start, bytes(self.buffer[:32]).hex())
+                if start < 0:
+                    del self.buffer[:-(len(MAGIC) - 1)]
+                    break
+                del self.buffer[:start]
+        return items
+
+
+async def handle_attachment_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peer = writer.get_extra_info("peername")
+    parser = AttachmentParser()
+    received = {}
+    serial = 0
+    LOGGER.info("attachment terminal connected peer=%s", peer)
+    read_timeout = float(os.getenv("JT1078_READ_TIMEOUT", "30"))
+    try:
+        while data := await asyncio.wait_for(reader.read(65536), timeout=read_timeout):
+            for item in parser.feed(data):
+                if item[0] == "data":
+                    _, name, data_offset, length = item
+                    received[name] = received.get(name, 0) + length
+                    LOGGER.debug("attachment data peer=%s file=%s offset=%d length=%d",
+                                 peer, name, data_offset, length)
+                    continue
+                message = parse_jt808(item[1])
+                if message is None:
+                    LOGGER.warning("attachment stream: bad JT808 frame peer=%s frame=%s", peer, item[1].hex())
+                    continue
+                LOGGER.info("attachment message 0x%04x peer=%s terminal=%s serial=%d body=%s",
+                            message.message_id, peer, message.terminal.hex(), message.serial, message.body.hex())
+                if message.message_id == 0x1212:
+                    LOGGER.info("attachment upload finished peer=%s bytes received per file=%s", peer, received)
+                if message.message_id in ATTACHMENT_ACKED_MESSAGES:
+                    writer.write(general_response(message, serial))
+                    serial = (serial + 1) & 0xFFFF
+                    await writer.drain()
+    except asyncio.TimeoutError:
+        LOGGER.warning("attachment terminal idle timeout peer=%s", peer)
+    except (ConnectionError, asyncio.IncompleteReadError):
+        pass
+    except Exception:
+        LOGGER.exception("attachment stream failed peer=%s", peer)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        LOGGER.info("attachment terminal disconnected peer=%s bytes received per file=%s", peer, received)
+
+
 async def main():
     live_port = int(os.getenv("JT1078_LIVE_PORT", "10002"))
     playback_port = int(os.getenv("JT1078_PLAYBACK_PORT", "10003"))
     status_port = int(os.getenv("JT1078_STATUS_PORT", "10004"))
+    attachment_port = int(os.getenv("JT1078_ATTACHMENT_PORT", "10006"))
     live_server = await asyncio.start_server(
         lambda reader, writer: handle_connection(reader, writer, "live"),
         "0.0.0.0", live_port)
@@ -676,14 +839,17 @@ async def main():
         lambda reader, writer: handle_connection(reader, writer, "playback"),
         "0.0.0.0", playback_port)
     status_server = await asyncio.start_server(handle_status, "0.0.0.0", status_port)
+    attachment_server = await asyncio.start_server(handle_attachment_connection, "0.0.0.0", attachment_port)
     LOGGER.info("JT1078 live receiver listening on port %d", live_port)
     LOGGER.info("JT1078 playback receiver listening on port %d", playback_port)
     LOGGER.info("JT1078 status endpoint listening on port %d", status_port)
-    async with live_server, playback_server, status_server:
+    LOGGER.info("active-safety attachment receiver listening on port %d", attachment_port)
+    async with live_server, playback_server, status_server, attachment_server:
         await asyncio.gather(
             live_server.serve_forever(),
             playback_server.serve_forever(),
-            status_server.serve_forever())
+            status_server.serve_forever(),
+            attachment_server.serve_forever())
 
 
 if __name__ == "__main__":

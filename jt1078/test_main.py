@@ -475,5 +475,70 @@ class HandleConnectionTest(unittest.IsolatedAsyncioTestCase):
         writer.close.assert_called_once()
 
 
+class AttachmentReceiverTest(unittest.IsolatedAsyncioTestCase):
+    # Header of a real DC600 0x1210 seen on the playback port on 2026-10-26
+    # (2013-style header, phone 806076813171, serial 0x0180).
+    TERMINAL = bytes.fromhex("806076813171")
+
+    def message(self, message_id, body, serial=0x0180):
+        return main.build_jt808(message_id, serial, self.TERMINAL, None, body)
+
+    def data_packet(self, name, offset, payload):
+        return (MAGIC + name.encode().ljust(main.ATTACHMENT_FILE_NAME_SIZE, b"\x00")
+                + offset.to_bytes(4, "big") + len(payload).to_bytes(4, "big") + payload)
+
+    def test_round_trips_and_escapes_a_jt808_frame(self):
+        body = bytes.fromhex("7e7d01")
+        frame = self.message(0x1210, body)
+        self.assertEqual(frame.count(b"\x7e"), 2)
+        parsed = main.parse_jt808(main.jt808_unescape(frame[1:-1]))
+        self.assertEqual((0x1210, 0x0180, self.TERMINAL, None, body),
+                         (parsed.message_id, parsed.serial, parsed.terminal, parsed.version, parsed.body))
+
+    def test_rejects_a_bad_checksum(self):
+        frame = bytearray(main.jt808_unescape(self.message(0x1210, b"\x01\x02")[1:-1]))
+        frame[-1] ^= 0xFF
+        self.assertIsNone(main.parse_jt808(bytes(frame)))
+
+    def test_parses_a_2019_header(self):
+        frame = main.build_jt808(0x1211, 7, bytes(10), 1, b"\xaa")
+        parsed = main.parse_jt808(main.jt808_unescape(frame[1:-1]))
+        self.assertEqual((0x1211, 7, 1, b"\xaa"), (parsed.message_id, parsed.serial, parsed.version, parsed.body))
+
+    def test_general_response_acks_the_message(self):
+        request = main.parse_jt808(main.jt808_unescape(self.message(0x1210, b"\x00")[1:-1]))
+        response = main.parse_jt808(main.jt808_unescape(main.general_response(request, 5)[1:-1]))
+        self.assertEqual(0x8001, response.message_id)
+        self.assertEqual(self.TERMINAL, response.terminal)
+        self.assertEqual(bytes.fromhex("0180121000"), response.body)
+
+    def test_splits_messages_and_data_packets_across_reads(self):
+        stream = (self.message(0x1211, b"\x01") + self.data_packet("a.jpg", 0, b"x" * 10)
+                  + self.data_packet("a.jpg", 10, b"y" * 5) + self.message(0x1212, b"\x02"))
+        parser = main.AttachmentParser()
+        items = []
+        for i in range(0, len(stream), 7):
+            items.extend(parser.feed(stream[i:i + 7]))
+        self.assertEqual(["message", "data", "data", "message"], [item[0] for item in items])
+        self.assertEqual(("data", "a.jpg", 10, 5), items[2])
+
+    async def test_acks_0x1210_and_0x1211_but_not_0x1212(self):
+        stream = [self.message(0x1210, b"\x01", 1), self.message(0x1211, b"\x02", 2),
+                  self.data_packet("a.jpg", 0, b"x" * 3), self.message(0x1212, b"\x03", 3), b""]
+        reader = AsyncMock()
+        reader.read = AsyncMock(side_effect=stream)
+        writer = MagicMock()
+        writer.get_extra_info.return_value = ("1.2.3.4", 1)
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+
+        await main.handle_attachment_connection(reader, writer)
+
+        acked = [main.parse_jt808(main.jt808_unescape(call.args[0][1:-1])).body
+                 for call in writer.write.call_args_list]
+        self.assertEqual([bytes.fromhex("0001121000"), bytes.fromhex("0002121100")], acked)
+        writer.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
