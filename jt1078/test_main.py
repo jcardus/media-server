@@ -520,24 +520,72 @@ class AttachmentReceiverTest(unittest.IsolatedAsyncioTestCase):
         for i in range(0, len(stream), 7):
             items.extend(parser.feed(stream[i:i + 7]))
         self.assertEqual(["message", "data", "data", "message"], [item[0] for item in items])
-        self.assertEqual(("data", "a.jpg", 10, 5), items[2])
+        self.assertEqual(("data", "a.jpg", 10, b"y" * 5), items[2])
 
-    async def test_acks_0x1210_and_0x1211_but_not_0x1212(self):
-        stream = [self.message(0x1210, b"\x01", 1), self.message(0x1211, b"\x02", 2),
-                  self.data_packet("a.jpg", 0, b"x" * 3), self.message(0x1212, b"\x03", 3), b""]
+    # A real DC600 0x1210 from 2026-10-28 (alarm 0x6402, 3 JPG + 1 MP4).
+    ALARM_LIST = bytes.fromhex(
+        "3000000000000030000000000000261028084945000400333030303030303030303030303032363130323830383439343530"
+        "30303430300004"
+        "3130305f36345f363430325f305f33303030303030303030303030303236313032383038343934353030303430302e6a706700007fcd"
+        "3130305f36345f363430325f315f33303030303030303030303030303236313032383038343934353030303430302e6a706700007fc8"
+        "3130305f36345f363430325f325f33303030303030303030303030303236313032383038343934353030303430302e6a706700007fdb"
+        "3130325f36345f363430325f335f33303030303030303030303030303236313032383038343934353030303430302e6d703400200000")
+    FILE_NAME = "00_64_6402_0_30000000000000261028084945000400.jpg"
+
+    def file_body(self, size, name=FILE_NAME, file_type=0):
+        return bytes((len(name),)) + name.encode() + bytes((file_type,)) + size.to_bytes(4, "big")
+
+    async def run_connection(self, stream):
         reader = AsyncMock()
-        reader.read = AsyncMock(side_effect=stream)
+        reader.read = AsyncMock(side_effect=stream + [b""])
         writer = MagicMock()
         writer.get_extra_info.return_value = ("1.2.3.4", 1)
         writer.drain = AsyncMock()
         writer.wait_closed = AsyncMock()
-
-        await main.handle_attachment_connection(reader, writer)
-
-        acked = [main.parse_jt808(main.jt808_unescape(call.args[0][1:-1])).body
-                 for call in writer.write.call_args_list]
-        self.assertEqual([bytes.fromhex("0001121000"), bytes.fromhex("0002121100")], acked)
+        with patch.object(main, "post_attachment", return_value="ok") as post:
+            await main.handle_attachment_connection(reader, writer)
         writer.close.assert_called_once()
+        replies = [main.parse_jt808(main.jt808_unescape(call.args[0][1:-1])) for call in writer.write.call_args_list]
+        return replies, post
+
+    def test_parses_a_real_0x1211_body(self):
+        body = bytes.fromhex(
+            "3130305f36345f363430325f305f33303030303030303030303030303236313032383038343934353030303430302e6a70670000007fcd")
+        self.assertEqual((self.FILE_NAME, 0, 0x7fcd), main.parse_attachment_file(body))
+        self.assertIsNone(main.parse_attachment_file(b"\x05ab"))
+
+    def test_missing_ranges(self):
+        self.assertEqual([], main.missing_ranges([(0, 5), (5, 5)], 10))
+        self.assertEqual([(3, 2), (8, 2)], main.missing_ranges([(5, 3), (0, 3)], 10))
+        self.assertEqual([(0, 4)], main.missing_ranges([], 4))
+
+    def test_terminal_number_strips_2019_padding(self):
+        message = main.Jt808Message(0x1212, 0, bytes.fromhex("00000000806076813171"), 1, b"")
+        self.assertEqual("806076813171", main.terminal_number(message))
+        message = main.Jt808Message(0x1212, 0, self.TERMINAL, None, b"")
+        self.assertEqual("806076813171", main.terminal_number(message))
+
+    async def test_acks_list_and_file_info_then_completes_and_stores_the_file(self):
+        stream = [self.message(0x1210, self.ALARM_LIST, 1), self.message(0x1211, self.file_body(8), 2),
+                  self.data_packet(self.FILE_NAME, 0, b"abcd") + self.data_packet(self.FILE_NAME, 4, b"efgh"),
+                  self.message(0x1212, self.file_body(8), 3)]
+        replies, post = await self.run_connection(stream)
+
+        self.assertEqual([0x8001, 0x8001, 0x9212], [reply.message_id for reply in replies])
+        self.assertEqual([bytes.fromhex("0001121000"), bytes.fromhex("0002121100")], [r.body for r in replies[:2]])
+        self.assertEqual(bytes((len(self.FILE_NAME),)) + self.FILE_NAME.encode() + b"\x00\x00\x00", replies[2].body)
+        post.assert_called_once_with(
+            "806076813171_30000000000000261028084945000400_" + self.FILE_NAME, b"abcdefgh")
+
+    async def test_asks_for_missing_ranges_and_does_not_store(self):
+        stream = [self.message(0x1210, self.ALARM_LIST, 1), self.message(0x1211, self.file_body(10), 2),
+                  self.data_packet(self.FILE_NAME, 0, b"abcd"), self.message(0x1212, self.file_body(10), 3)]
+        replies, post = await self.run_connection(stream)
+
+        body = replies[-1].body
+        self.assertEqual(0x9212, replies[-1].message_id)
+        self.assertEqual(bytes.fromhex("0001010000000400000006"), body[1 + len(self.FILE_NAME):])
+        post.assert_not_called()
 
 
 if __name__ == "__main__":

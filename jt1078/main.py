@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import urllib.request
 from dataclasses import dataclass
 
 
@@ -671,12 +672,18 @@ async def handle_connection(
 # finished - interleaved with file-data packets that reuse the JT1078
 # 0x30316364 magic but carry a different header (50-byte file name, offset,
 # length). That is why this is not served on the playback port: PacketParser
-# would misread the data packets as video. For now this only acks 0x1210 and
-# 0x1211, logs every message body in full and counts file bytes, so the real
-# file names, sizes and data flow can be seen before files are stored.
+# would misread the data packets as video. 0x1210 and 0x1211 get a 0x8001;
+# 0x1212 gets a 0x9212 (complete, or the missing ranges to resend) - the
+# terminal waits for it before sending the next file, and without it the
+# DC600 only ever sent file 1 and then resent the whole alarm. Each complete
+# file is handed to the upload sink, which files it under
+# <terminal>/<alarm identifier>/ - the same folder Traccar's POST /event
+# writes the alarm type to.
 ATTACHMENT_FILE_NAME_SIZE = 50
 ATTACHMENT_DATA_HEADER_SIZE = len(MAGIC) + ATTACHMENT_FILE_NAME_SIZE + 8
 ATTACHMENT_ACKED_MESSAGES = (0x1210, 0x1211)
+ATTACHMENT_MAX_BYTES = int(os.getenv("JT1078_ATTACHMENT_MAX_BYTES", str(64 * 1024 * 1024)))
+ATTACHMENT_SINK_URL = os.getenv("JT1078_ATTACHMENT_SINK_URL", "http://upload:10005/upload")
 
 
 def jt808_unescape(data: bytes) -> bytes:
@@ -774,7 +781,8 @@ class AttachmentParser:
                 length = int.from_bytes(self.buffer[name_end + 4:name_end + 8], "big")
                 if len(self.buffer) < ATTACHMENT_DATA_HEADER_SIZE + length:
                     break
-                items.append(("data", name, data_offset, length))
+                payload = bytes(self.buffer[ATTACHMENT_DATA_HEADER_SIZE:ATTACHMENT_DATA_HEADER_SIZE + length])
+                items.append(("data", name, data_offset, payload))
                 del self.buffer[:ATTACHMENT_DATA_HEADER_SIZE + length]
             else:
                 start = min((i for i in (self.buffer.find(b"\x7e"), self.buffer.find(MAGIC)) if i >= 0), default=-1)
@@ -787,21 +795,99 @@ class AttachmentParser:
         return items
 
 
+def parse_attachment_file(body: bytes) -> tuple[str, int, int] | None:
+    """0x1211 / 0x1212 body: name length, name, file type, file size."""
+    if not body:
+        return None
+    end = 1 + body[0]
+    if len(body) < end + 5:
+        return None
+    name = body[1:end].decode("ascii", "replace")
+    return name, body[end], int.from_bytes(body[end + 1:end + 5], "big")
+
+
+def missing_ranges(ranges: list[tuple[int, int]], size: int) -> list[tuple[int, int]]:
+    """(offset, length) gaps in [0, size) not covered by the received ranges."""
+    missing = []
+    position = 0
+    for offset, length in sorted(ranges):
+        if offset > position:
+            missing.append((position, offset - position))
+        position = max(position, offset + length)
+    if position < size:
+        missing.append((position, size - position))
+    return missing
+
+
+def upload_complete_response(message: Jt808Message, serial: int, name: str, file_type: int,
+                             missing: list[tuple[int, int]]) -> bytes:
+    """0x9212: result 0 = complete, 1 = resend the listed (offset, length) ranges."""
+    encoded = name.encode("ascii", "replace")
+    missing = missing[:255]
+    body = bytearray((len(encoded),))
+    body.extend(encoded)
+    body.extend((file_type, 1 if missing else 0, len(missing)))
+    for offset, length in missing:
+        body.extend(offset.to_bytes(4, "big") + length.to_bytes(4, "big"))
+    return build_jt808(0x9212, serial, message.terminal, message.version, bytes(body))
+
+
+def terminal_number(message: Jt808Message) -> str:
+    """The BCD phone number the device is registered under (its Traccar uniqueId)."""
+    number = message.terminal.hex()
+    if message.version is not None:
+        # 2019 headers zero-pad the number to 20 digits.
+        number = number.lstrip("0").rjust(12, "0")
+    return number
+
+
+def post_attachment(stored_name: str, data: bytes) -> str:
+    request = urllib.request.Request(
+        ATTACHMENT_SINK_URL, data=data, method="POST",
+        headers={"Content-Type": "application/octet-stream",
+                 "Content-Disposition": f'attachment; filename="{stored_name}"'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read(512).decode("utf-8", "replace")
+
+
+async def store_attachment(terminal: str, identifier: str | None, name: str, data: bytes):
+    # The sink files <terminal>_<identifier>_* under <terminal>/<identifier>/.
+    stored_name = f"{terminal}_{identifier or 'unknown'}_{name}"
+    try:
+        reply = await asyncio.to_thread(post_attachment, stored_name, data)
+        LOGGER.info("attachment stored file=%s bytes=%d sink=%s", stored_name, len(data), reply)
+    except Exception:
+        LOGGER.exception("attachment store failed file=%s bytes=%d", stored_name, len(data))
+
+
 async def handle_attachment_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
     parser = AttachmentParser()
-    received = {}
+    files = {}
+    identifier = None
     serial = 0
     LOGGER.info("attachment terminal connected peer=%s", peer)
     read_timeout = float(os.getenv("JT1078_READ_TIMEOUT", "30"))
+
+    def received():
+        return {name: len(entry["data"]) for name, entry in files.items()}
+
     try:
         while data := await asyncio.wait_for(reader.read(65536), timeout=read_timeout):
             for item in parser.feed(data):
                 if item[0] == "data":
-                    _, name, data_offset, length = item
-                    received[name] = received.get(name, 0) + length
+                    _, name, data_offset, payload = item
+                    entry = files.setdefault(name, {"data": bytearray(), "ranges": []})
+                    if data_offset + len(payload) > ATTACHMENT_MAX_BYTES:
+                        LOGGER.warning("attachment data beyond %d bytes dropped peer=%s file=%s offset=%d",
+                                       ATTACHMENT_MAX_BYTES, peer, name, data_offset)
+                        continue
+                    if len(entry["data"]) < data_offset + len(payload):
+                        entry["data"].extend(bytes(data_offset + len(payload) - len(entry["data"])))
+                    entry["data"][data_offset:data_offset + len(payload)] = payload
+                    entry["ranges"].append((data_offset, len(payload)))
                     LOGGER.debug("attachment data peer=%s file=%s offset=%d length=%d",
-                                 peer, name, data_offset, length)
+                                 peer, name, data_offset, len(payload))
                     continue
                 message = parse_jt808(item[1])
                 if message is None:
@@ -809,12 +895,29 @@ async def handle_attachment_connection(reader: asyncio.StreamReader, writer: asy
                     continue
                 LOGGER.info("attachment message 0x%04x peer=%s terminal=%s serial=%d body=%s",
                             message.message_id, peer, message.terminal.hex(), message.serial, message.body.hex())
-                if message.message_id == 0x1212:
-                    LOGGER.info("attachment upload finished peer=%s bytes received per file=%s", peer, received)
+                if message.message_id == 0x1210 and len(message.body) >= 23:
+                    # terminal id[7], then the 16-byte alarm identifier from the 0x64/0x65 alarm.
+                    identifier = message.body[7:23].hex()
                 if message.message_id in ATTACHMENT_ACKED_MESSAGES:
                     writer.write(general_response(message, serial))
                     serial = (serial + 1) & 0xFFFF
                     await writer.drain()
+                if message.message_id != 0x1212:
+                    continue
+                info = parse_attachment_file(message.body)
+                if info is None:
+                    LOGGER.warning("attachment stream: unparseable 0x1212 peer=%s body=%s", peer, message.body.hex())
+                    continue
+                name, file_type, size = info
+                entry = files.get(name, {"data": bytearray(), "ranges": []})
+                missing = missing_ranges(entry["ranges"], min(size, ATTACHMENT_MAX_BYTES))
+                LOGGER.info("attachment upload finished peer=%s file=%s size=%d missing=%s bytes received per file=%s",
+                            peer, name, size, missing, received())
+                writer.write(upload_complete_response(message, serial, name, file_type, missing))
+                serial = (serial + 1) & 0xFFFF
+                await writer.drain()
+                if not missing:
+                    await store_attachment(terminal_number(message), identifier, name, bytes(entry["data"][:size]))
     except asyncio.TimeoutError:
         LOGGER.warning("attachment terminal idle timeout peer=%s", peer)
     except (ConnectionError, asyncio.IncompleteReadError):
@@ -824,7 +927,7 @@ async def handle_attachment_connection(reader: asyncio.StreamReader, writer: asy
     finally:
         writer.close()
         await writer.wait_closed()
-        LOGGER.info("attachment terminal disconnected peer=%s bytes received per file=%s", peer, received)
+        LOGGER.info("attachment terminal disconnected peer=%s bytes received per file=%s", peer, received())
 
 
 async def main():
