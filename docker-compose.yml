@@ -78,6 +78,37 @@ services:
       - ${ATTACHMENTS_DIR:-./attachments}:/data/attachments
     logging: *cloudwatch
 
+  # FTP receiver for JT/T 1078 0x9206 recording uploads (Traccar videoUpload
+  # command): cameras connect directly (not via Cloudflare), every finished
+  # file is pushed to S3 and removed locally. See ftp/main.py. Needs in .env:
+  # FTP_USER, FTP_PASSWORD, FTP_MASQUERADE_ADDRESS (public IP), FTP_S3_BUCKET,
+  # and AWS credentials that can s3:PutObject to it.
+  ftp:
+    build: ./ftp
+    container_name: media-ftp
+    restart: unless-stopped
+    ports:
+      - "21:21"
+      - "30000-30009:30000-30009"   # passive data connections
+    environment:
+      - FTP_PORT=21
+      - FTP_PASSIVE_PORTS=30000-30009
+      - FTP_USER=${FTP_USER}
+      - FTP_PASSWORD=${FTP_PASSWORD}
+      - FTP_MASQUERADE_ADDRESS=${FTP_MASQUERADE_ADDRESS}
+      - S3_BUCKET=${FTP_S3_BUCKET}
+      - S3_PREFIX=${FTP_S3_PREFIX:-recordings/}
+      - AWS_REGION=${FTP_S3_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - SPOOL_DIR=/data/ftp
+      - RETRY_DIR=/data/ftp-retry
+    volumes:
+      # Only uploads in flight (and failed S3 pushes) live here; one volume so
+      # parking a file for retry is a rename.
+      - ${FTP_SPOOL_DIR:-./ftp-spool}:/data
+    logging: *cloudwatch
+
   # Edge on :80 for media.n-gps.com: MediaMTX WebRTC as before, plus
   # /media-status/ -> jt1078 :10004 /status endpoint and /attachments/ -> upload.
   nginx:
