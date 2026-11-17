@@ -216,8 +216,24 @@ class Publisher:
         # a broken pipe, and its retry must not spawn a fresh ffmpeg on
         # the path the replacing connection is about to publish to.
         self.closed = False
+        # Serialises start() so _commit's await create_subprocess_exec and a
+        # concurrent _deliver (packets keep arriving once decided=True) cannot
+        # both spawn ffmpeg for the same path. Observed in CloudWatch as two
+        # "starting publisher ... audio=False" lines ~5ms apart and two
+        # orphaned ffmpeg processes fighting MediaMTX.
+        self._start_lock = asyncio.Lock()
 
     async def start(self):
+        async with self._start_lock:
+            if self.closed:
+                return
+            # Another waiter already brought up a healthy process while we
+            # queued on the lock (the _commit/_deliver race above).
+            if self.process is not None and self.process.returncode is None:
+                return
+            await self._start_unlocked()
+
+    async def _start_unlocked(self):
         if self.started_at is not None:
             self.restart_count += 1
         self.started_at = time.monotonic()
