@@ -1,4 +1,7 @@
+import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -14,6 +17,11 @@ class FakeS3:
         if self.fail:
             raise OSError("s3 down")
         self.uploads.append((Path(filename).read_bytes(), bucket, key))
+
+    def put_object(self, Bucket, Key, Body, ContentType):
+        if self.fail:
+            raise OSError("s3 down")
+        self.uploads.append((Body, Bucket, Key))
 
 
 class S3KeyTest(unittest.TestCase):
@@ -64,6 +72,28 @@ class ReceivedTest(unittest.TestCase):
         main.retry_once()
         self.assertEqual([(b"video", "bucket", "recordings/869247060606701/1.mp4")], fake.uploads)
         self.assertFalse(parked.exists())
+
+
+class ProgressTest(ReceivedTest):
+    def test_a_growing_upload_gets_a_marker_outside_the_recordings_prefix(self):
+        fake = FakeS3()
+        self.patch("_s3", fake)
+        main.report_progress()
+        self.assertEqual([(json.dumps({"bytes": 5}).encode(), "bucket",
+                           "recordings-progress/869247060606701/1.mp4.json")], fake.uploads)
+
+    def test_an_upload_that_stopped_growing_is_not_reported(self):
+        fake = FakeS3()
+        self.patch("_s3", fake)
+        old = time.time() - main.PROGRESS_INTERVAL - 5
+        os.utime(self.file, (old, old))
+        main.report_progress()
+        self.assertEqual([], fake.uploads)
+
+    def test_a_failed_marker_is_only_logged(self):
+        self.patch("_s3", FakeS3(fail=True))
+        with self.assertLogs(main.log, level="WARNING"):
+            main.report_progress()
 
 
 if __name__ == "__main__":
