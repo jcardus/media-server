@@ -14,15 +14,24 @@ uploads in flight. If the S3 push fails the file is moved to RETRY_DIR and
 retried every RETRY_INTERVAL seconds. A transfer that breaks off half-way is
 left where it is (the camera may resume it with REST) and never pushed.
 
+While a file is uploading, every PROGRESS_INTERVAL seconds a small marker
+{"bytes": <size so far>} is written to S3_BUCKET as PROGRESS_PREFIX + <path as
+uploaded> + ".json", but only for files that grew since the last sweep. The
+marker's S3 LastModified is therefore "bytes last arrived", which the camera
+recording sync (pinme-backend-v2 cameraSync.js) reads so it doesn't time out
+and re-request a slow upload that is still going (ticket #296).
+
 One shared account (FTP_USER / FTP_PASSWORD) for every camera. Cameras reach
 this port directly (Cloudflare doesn't proxy FTP), and passive mode needs
 FTP_MASQUERADE_ADDRESS set to the host's public IP because of docker's NAT.
 """
+import json
 import logging
 import os
 import re
 import shutil
 import threading
+import time
 from pathlib import Path, PurePosixPath
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -34,6 +43,10 @@ RETRY_DIR = Path(os.getenv("RETRY_DIR", "/data/ftp-retry"))
 RETRY_INTERVAL = int(os.getenv("RETRY_INTERVAL", "300"))
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 S3_PREFIX = os.getenv("S3_PREFIX", "recordings/")
+# Outside S3_PREFIX on purpose: anything under recordings/<imei>/<request>/ counts as
+# an uploaded file for the sync.
+PROGRESS_PREFIX = os.getenv("PROGRESS_PREFIX", "recordings-progress/")
+PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "30"))
 # Read when the server starts: tests import this module without them.
 FTP_USER = os.getenv("FTP_USER", "")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD", "")
@@ -56,11 +69,11 @@ def s3():
     return _s3
 
 
-def s3_key(relative: str) -> str:
+def s3_key(relative: str, prefix: str = None) -> str:
     """S3 key for a spool-relative path: each segment sanitized, no '..'."""
     parts = [SAFE_PART.sub("_", part) for part in PurePosixPath(relative).parts
              if part not in ("", "/", ".", "..")]
-    return S3_PREFIX + "/".join(part for part in parts if part)
+    return (S3_PREFIX if prefix is None else prefix) + "/".join(part for part in parts if part)
 
 
 def push(path: Path, root: Path) -> bool:
@@ -86,6 +99,38 @@ def received(path: Path):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(path), str(target))
     log.warning("parked for retry: %s", target)
+
+
+def report_progress(now: float = None):
+    """Write a progress marker for every spool file written to in the last sweep.
+
+    A file is "growing" if its mtime is within PROGRESS_INTERVAL; incomplete
+    uploads left behind for a REST resume stop changing, so they stop being
+    reported. Failures are only logged: the marker is advisory.
+    """
+    now = time.time() if now is None else now
+    for path in SPOOL_DIR.rglob("*"):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:  # pushed and removed meanwhile
+            continue
+        if not path.is_file() or now - stat.st_mtime > PROGRESS_INTERVAL:
+            continue
+        relative = path.relative_to(SPOOL_DIR).as_posix()
+        key = s3_key(relative, PROGRESS_PREFIX) + ".json"
+        try:
+            s3().put_object(Bucket=S3_BUCKET, Key=key, ContentType="application/json",
+                            Body=json.dumps({"bytes": stat.st_size}).encode())
+        except Exception as exc:
+            log.warning("progress marker failed file=%s key=%s: %s", relative, key, exc)
+
+
+def _progress_loop(stop: threading.Event):
+    while not stop.wait(PROGRESS_INTERVAL):
+        try:
+            report_progress()
+        except Exception:
+            log.exception("progress sweep failed")
 
 
 def retry_once():
@@ -140,6 +185,7 @@ if __name__ == "__main__":
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     RETRY_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_retry_loop, args=(threading.Event(),), daemon=True).start()
+    threading.Thread(target=_progress_loop, args=(threading.Event(),), daemon=True).start()
     log.info("ftp receiver on :%d passive=%s spool=%s -> s3://%s/%s",
              PORT, PASSIVE_PORTS, SPOOL_DIR, S3_BUCKET, S3_PREFIX)
     build_server().serve_forever()
