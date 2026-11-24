@@ -46,6 +46,15 @@ def audio_codec_for_payload_type(payload_type: int) -> tuple[str, str]:
         os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))
 
 
+def video_codec_for_payload_type(payload_type: int) -> str:
+    """Map JT1078 video payload types to FFmpeg raw-input formats."""
+    if payload_type == 98:
+        return "h264"
+    if payload_type == 99:
+        return "hevc"
+    return os.getenv("JT1078_VIDEO_CODEC", "h264")
+
+
 def prepare_audio_frame(frame: bytes, codec: str, sample_rate: str, channels: int = 1) -> bytes:
     if codec != "aac" or frame.startswith((b"\xff\xf0", b"\xff\xf1", b"\xff\xf8", b"\xff\xf9")):
         return frame
@@ -191,6 +200,7 @@ class Publisher:
         # else, including the DC600's G.711A (payload type 6).
         self.audio_codec = None
         self.audio_sample_rate = None
+        self.video_codec = None
         # Whether to include an audio input in the ffmpeg command. Channels
         # that never send audio must not block video: FFmpeg blocks opening
         # a second -i until it can probe it. A new publisher waits a short
@@ -225,7 +235,7 @@ class Publisher:
             self.audio_input.close()
             self.audio_input = None
         target = f"rtsp://mediamtx:8554/rtc/{self.path}"
-        codec = os.getenv("JT1078_VIDEO_CODEC", "h264")
+        codec = self.video_codec or os.getenv("JT1078_VIDEO_CODEC", "h264")
         args = [
             "ffmpeg",
             "-hide_banner",
@@ -360,6 +370,8 @@ class Publisher:
             frame = prepare_audio_frame(frame, self.audio_codec, self.audio_sample_rate)
         else:
             self.last_video_at = time.monotonic()
+            if self.video_codec is None:
+                self.video_codec = video_codec_for_payload_type(payload_type)
             if not frame.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
                 frame = b"\x00\x00\x00\x01" + frame
 
@@ -438,7 +450,7 @@ class Publisher:
                         LOGGER.info(
                             "JT1078 video path=%s payloadType=%d configuredCodec=%s",
                             self.path, payload_type,
-                            os.getenv("JT1078_VIDEO_CODEC", "h264"))
+                            self.video_codec or os.getenv("JT1078_VIDEO_CODEC", "h264"))
                     self.process.stdin.write(frame)
                     # Same stall as audio above, on the video pipe. Left
                     # unbounded, it hangs the packet loop outside the read

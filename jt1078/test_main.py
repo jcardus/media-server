@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
 from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_codec_for_payload_type, \
-    audio_input_options, decode_terminal_id, prepare_audio_frame
+    audio_input_options, decode_terminal_id, prepare_audio_frame, video_codec_for_payload_type
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -38,6 +38,10 @@ class PacketParserTest(unittest.TestCase):
         # (see git history), not the Jimi-specific AAC default.
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(6))
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(0))
+
+    def test_video_codec_for_payload_type(self):
+        self.assertEqual("h264", video_codec_for_payload_type(98))
+        self.assertEqual("hevc", video_codec_for_payload_type(99))
 
     def test_prepare_audio_frame(self):
         raw = b"\x21\x10\x04\x60"
@@ -357,7 +361,7 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         lines = [line for line in logs.output if "JT1078 video" in line]
         self.assertEqual(1, len(lines))
         self.assertIn("payloadType=99", lines[0])
-        self.assertIn("configuredCodec=h264", lines[0])
+        self.assertIn("configuredCodec=hevc", lines[0])
 
     async def test_commits_video_only_after_grace_period(self):
         publisher = Publisher("860112070346616", 1, "live")
