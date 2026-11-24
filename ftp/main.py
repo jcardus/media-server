@@ -18,6 +18,12 @@ connection as soon as the data is sent, which the FTP server counts as incomplet
 although the whole file arrived. Then a file untouched for that many seconds is
 pushed anyway, with the S3 object metadata partial=true.
 
+Hikvision G40 cameras write their clips with an "IMKH" header and an .mp4 name, but the
+content is an MPEG program stream that QuickTime and browsers cannot open. Such files are
+rewritten into a standard MP4 (video copied, not re-encoded; HEVC tagged hvc1 for QuickTime,
+audio to AAC) before they are pushed, under the same S3 key. If ffmpeg fails the original is
+pushed instead. CONVERT_IMKH=0 turns this off.
+
 While a file is uploading, every PROGRESS_INTERVAL seconds a small marker
 {"bytes": <size so far>} is written to S3_BUCKET as PROGRESS_PREFIX + <path as
 uploaded> + ".json", but only for files that grew since the last sweep. The
@@ -34,6 +40,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -53,6 +61,9 @@ PROGRESS_PREFIX = os.getenv("PROGRESS_PREFIX", "recordings-progress/")
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "30"))
 # Seconds an incomplete upload may sit untouched before it is pushed anyway; 0 = never.
 INCOMPLETE_PUSH_AFTER = int(os.getenv("INCOMPLETE_PUSH_AFTER", "0"))
+# Rewrite Hikvision "IMKH" files as standard MP4 before pushing them.
+CONVERT_IMKH = os.getenv("CONVERT_IMKH", "1") not in ("0", "false", "")
+CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "300"))
 # Read when the server starts: tests import this module without them.
 FTP_USER = os.getenv("FTP_USER", "")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD", "")
@@ -82,21 +93,72 @@ def s3_key(relative: str, prefix: str = None) -> str:
     return (S3_PREFIX if prefix is None else prefix) + "/".join(part for part in parts if part)
 
 
+def is_imkh(path: Path) -> bool:
+    """True for a Hikvision "IMKH" file (a program stream that has an .mp4 name)."""
+    try:
+        with path.open("rb") as file:
+            return file.read(4) == b"IMKH"
+    except OSError:
+        return False
+
+
+def convert_imkh(path: Path):
+    """Standard MP4 copy of a Hikvision IMKH file in a temporary file, or None.
+
+    The video is copied, not re-encoded (HEVC gets the hvc1 tag QuickTime needs) and any audio
+    becomes AAC. None when the file is not IMKH, conversion is off, or ffmpeg fails: the caller
+    then pushes the original.
+    """
+    if not CONVERT_IMKH or not is_imkh(path):
+        return None
+    codec = ""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+             "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=60)
+        codec = probe.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("ffprobe failed file=%s: %s", path, exc)
+    handle, name = tempfile.mkstemp(suffix=".mp4")
+    os.close(handle)
+    output = Path(name)
+    command = ["ffmpeg", "-v", "error", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy"]
+    if codec == "hevc":
+        command += ["-tag:v", "hvc1"]
+    command += ["-c:a", "aac", "-movflags", "+faststart", str(output)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=CONVERT_TIMEOUT)
+        if result.returncode == 0 and output.stat().st_size > 0:
+            return output
+        log.warning("ffmpeg could not convert file=%s (exit %s): %s", path, result.returncode,
+                    (result.stderr or "").strip()[-300:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("ffmpeg failed file=%s: %s", path, exc)
+    output.unlink(missing_ok=True)
+    return None
+
+
 def push(path: Path, root: Path, extra_args: dict = None) -> bool:
     """Upload `path` (under `root`) to S3 and delete it locally; True on success."""
     relative = path.relative_to(root).as_posix()
     key = s3_key(relative)
-    size = path.stat().st_size
+    converted = convert_imkh(path)
+    source = converted or path
+    size = source.stat().st_size
     try:
         if extra_args:
-            s3().upload_file(str(path), S3_BUCKET, key, ExtraArgs=extra_args)
+            s3().upload_file(str(source), S3_BUCKET, key, ExtraArgs=extra_args)
         else:
-            s3().upload_file(str(path), S3_BUCKET, key)
+            s3().upload_file(str(source), S3_BUCKET, key)
     except Exception as exc:
         log.error("s3 upload failed file=%s bucket=%s key=%s: %s", relative, S3_BUCKET, key, exc)
         return False
+    finally:
+        if converted:
+            converted.unlink(missing_ok=True)
     path.unlink(missing_ok=True)
-    log.info("stored file=%s bytes=%d s3://%s/%s", relative, size, S3_BUCKET, key)
+    log.info("stored file=%s bytes=%d s3://%s/%s%s", relative, size, S3_BUCKET, key,
+             " (converted from IMKH)" if converted else "")
     return True
 
 
