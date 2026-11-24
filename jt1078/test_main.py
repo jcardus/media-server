@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
 from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_codec_for_payload_type, \
-    audio_input_options, decode_terminal_id, prepare_audio_frame
+    audio_input_options, decode_terminal_id, prepare_audio_frame, strip_hisilicon_header
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -45,6 +45,12 @@ class PacketParserTest(unittest.TestCase):
         self.assertEqual(bytes.fromhex("fff16c40017ffc") + raw, framed)
         self.assertIs(framed, prepare_audio_frame(framed, "aac", "8000"))
         self.assertIs(raw, prepare_audio_frame(raw, "alaw", "8000"))
+
+    def test_strip_hisilicon_header(self):
+        payload = b"video-payload"
+        frame = b"\x00\x01" + bytes([(len(payload) // 2)]) + b"\x00" + payload
+        self.assertEqual(payload, strip_hisilicon_header(frame))
+        self.assertEqual(b"\x00\x01\x03\x00video", strip_hisilicon_header(b"\x00\x01\x03\x00video"))
 
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
