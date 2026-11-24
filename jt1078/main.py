@@ -41,6 +41,10 @@ def audio_codec_for_payload_type(payload_type: int) -> tuple[str, str]:
         return (
             os.getenv("JT1078_AUDIO_CODEC", "aac"),
             os.getenv("JT1078_AUDIO_SAMPLE_RATE", "8000"))
+    if payload_type == 6:
+        return ("alaw", os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))
+    if payload_type == 7:
+        return ("mulaw", os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))
     return (
         os.getenv("JT1078_AUDIO_CODEC_FALLBACK", "alaw"),
         os.getenv("JT1078_AUDIO_SAMPLE_RATE_FALLBACK", "8000"))

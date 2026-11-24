@@ -37,6 +37,7 @@ class PacketParserTest(unittest.TestCase):
         # this project's original default before the Jimi cameras arrived
         # (see git history), not the Jimi-specific AAC default.
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(6))
+        self.assertEqual(("mulaw", "8000"), audio_codec_for_payload_type(7))
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(0))
 
     def test_video_codec_for_payload_type(self):
