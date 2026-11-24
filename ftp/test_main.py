@@ -12,11 +12,13 @@ class FakeS3:
     def __init__(self, fail=False):
         self.fail = fail
         self.uploads = []
+        self.extra_args = []
 
-    def upload_file(self, filename, bucket, key):
+    def upload_file(self, filename, bucket, key, ExtraArgs=None):
         if self.fail:
             raise OSError("s3 down")
         self.uploads.append((Path(filename).read_bytes(), bucket, key))
+        self.extra_args.append(ExtraArgs)
 
     def put_object(self, Bucket, Key, Body, ContentType):
         if self.fail:
@@ -32,6 +34,41 @@ class S3KeyTest(unittest.TestCase):
     def test_cannot_climb_out_of_the_prefix(self):
         self.assertEqual("recordings/etc/passwd", main.s3_key("../../etc/passwd"))
         self.assertEqual("recordings/a_b/c_d.mp4", main.s3_key("/a b/./c?d.mp4"))
+
+
+class StaleIncompleteTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.spool = Path(directory.name) / "ftp"
+        self.file = self.spool / "062996769808" / "alarm" / "ch02.mp4"
+        self.file.parent.mkdir(parents=True)
+        self.file.write_bytes(b"video")
+        self.fake = FakeS3()
+        for name, value in (("SPOOL_DIR", self.spool), ("S3_BUCKET", "bucket"), ("_s3", self.fake)):
+            old = getattr(main, name)
+            setattr(main, name, value)
+            self.addCleanup(setattr, main, name, old)
+
+    def sweep(self, after, age):
+        old = main.INCOMPLETE_PUSH_AFTER
+        main.INCOMPLETE_PUSH_AFTER = after
+        self.addCleanup(setattr, main, "INCOMPLETE_PUSH_AFTER", old)
+        return main.push_stale_incomplete(now=self.file.stat().st_mtime + age)
+
+    def test_disabled_by_default(self):
+        self.assertEqual(0, self.sweep(0, 3600))
+        self.assertTrue(self.file.exists())
+
+    def test_a_file_untouched_for_long_enough_is_pushed_as_partial(self):
+        self.assertEqual(1, self.sweep(60, 61))
+        self.assertEqual([(b"video", "bucket", "recordings/062996769808/alarm/ch02.mp4")], self.fake.uploads)
+        self.assertEqual([{"Metadata": {"partial": "true"}}], self.fake.extra_args)
+        self.assertFalse(self.file.exists())
+
+    def test_a_file_still_being_written_is_left_alone(self):
+        self.assertEqual(0, self.sweep(60, 10))
+        self.assertTrue(self.file.exists())
 
 
 class ReceivedTest(unittest.TestCase):

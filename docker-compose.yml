@@ -93,6 +93,8 @@ services:
     environment:
       - FTP_PORT=21
       - FTP_PASSIVE_PORTS=30000-30009
+      # Push uploads the camera left "incomplete" after this many idle seconds (0 = never).
+      - INCOMPLETE_PUSH_AFTER=${FTP_INCOMPLETE_PUSH_AFTER:-0}
       - FTP_USER=${FTP_USER}
       - FTP_PASSWORD=${FTP_PASSWORD}
       - FTP_MASQUERADE_ADDRESS=${FTP_MASQUERADE_ADDRESS}
