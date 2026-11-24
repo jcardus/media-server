@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
 from main import MAGIC, Connection, Packet, PacketParser, Publisher, audio_codec_for_payload_type, \
-    audio_input_options, decode_terminal_id, prepare_audio_frame, strip_hisilicon_header
+    audio_input_options, decode_terminal_id, prepare_audio_frame, video_codec_for_payload_type
 
 
 def packet(payload, data_type=0, fragment_type=0, sequence=1, channel=1, timestamp=123, payload_type=96):
@@ -39,18 +39,16 @@ class PacketParserTest(unittest.TestCase):
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(6))
         self.assertEqual(("alaw", "8000"), audio_codec_for_payload_type(0))
 
+    def test_video_codec_for_payload_type(self):
+        self.assertEqual("h264", video_codec_for_payload_type(98))
+        self.assertEqual("hevc", video_codec_for_payload_type(99))
+
     def test_prepare_audio_frame(self):
         raw = b"\x21\x10\x04\x60"
         framed = prepare_audio_frame(raw, "aac", "8000")
         self.assertEqual(bytes.fromhex("fff16c40017ffc") + raw, framed)
         self.assertIs(framed, prepare_audio_frame(framed, "aac", "8000"))
         self.assertIs(raw, prepare_audio_frame(raw, "alaw", "8000"))
-
-    def test_strip_hisilicon_header(self):
-        payload = b"video-payload"
-        frame = b"\x00\x01" + bytes([(len(payload) // 2)]) + b"\x00" + payload
-        self.assertEqual(payload, strip_hisilicon_header(frame))
-        self.assertEqual(b"\x00\x01\x03\x00video", strip_hisilicon_header(b"\x00\x01\x03\x00video"))
 
     def test_decode_terminal_id(self):
         self.assertEqual("860112070346616", decode_terminal_id(bytes.fromhex("4e3a0b712725")))
@@ -363,7 +361,7 @@ class PublisherTest(unittest.IsolatedAsyncioTestCase):
         lines = [line for line in logs.output if "JT1078 video" in line]
         self.assertEqual(1, len(lines))
         self.assertIn("payloadType=99", lines[0])
-        self.assertIn("configuredCodec=h264", lines[0])
+        self.assertIn("configuredCodec=hevc", lines[0])
 
     async def test_commits_video_only_after_grace_period(self):
         publisher = Publisher("860112070346616", 1, "live")
