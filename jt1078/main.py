@@ -64,6 +64,22 @@ def prepare_audio_frame(frame: bytes, codec: str, sample_rate: str, channels: in
     return header + frame
 
 
+def strip_hisilicon_header(frame: bytes) -> bytes:
+    """Remove the optional four-byte HiSilicon payload header.
+
+    Some camera encoders prefix each JT1078 payload with ``00 01 XX 00``,
+    where XX is half of the remaining payload length. Passing that header to
+    FFmpeg makes it interpret the first video byte as an H.264 NAL header.
+    """
+    if (
+            len(frame) >= 4
+            and frame[0:2] == b"\x00\x01"
+            and frame[2] == (len(frame) - 4) // 2
+            and frame[3] == 0):
+        return frame[4:]
+    return frame
+
+
 def luhn(number: int) -> int:
     total = 0
     for index, value in enumerate(reversed(str(number))):
@@ -353,6 +369,7 @@ class Publisher:
 
     async def write(self, frame: bytes, data_type: int, payload_type: int):
         is_audio = data_type == 3
+        frame = strip_hisilicon_header(frame)
         if is_audio:
             self.last_audio_at = time.monotonic()
             if self.audio_codec is None:
