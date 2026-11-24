@@ -12,7 +12,11 @@ Every completed file is pushed to S3_BUCKET as S3_PREFIX + <path as
 uploaded> and then removed from the local spool, so the disk only holds
 uploads in flight. If the S3 push fails the file is moved to RETRY_DIR and
 retried every RETRY_INTERVAL seconds. A transfer that breaks off half-way is
-left where it is (the camera may resume it with REST) and never pushed.
+left where it is (the camera may resume it with REST) and never pushed - unless
+INCOMPLETE_PUSH_AFTER is set: some cameras (Hikvision G40) drop the control
+connection as soon as the data is sent, which the FTP server counts as incomplete
+although the whole file arrived. Then a file untouched for that many seconds is
+pushed anyway, with the S3 object metadata partial=true.
 
 While a file is uploading, every PROGRESS_INTERVAL seconds a small marker
 {"bytes": <size so far>} is written to S3_BUCKET as PROGRESS_PREFIX + <path as
@@ -47,6 +51,8 @@ S3_PREFIX = os.getenv("S3_PREFIX", "recordings/")
 # an uploaded file for the sync.
 PROGRESS_PREFIX = os.getenv("PROGRESS_PREFIX", "recordings-progress/")
 PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "30"))
+# Seconds an incomplete upload may sit untouched before it is pushed anyway; 0 = never.
+INCOMPLETE_PUSH_AFTER = int(os.getenv("INCOMPLETE_PUSH_AFTER", "0"))
 # Read when the server starts: tests import this module without them.
 FTP_USER = os.getenv("FTP_USER", "")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD", "")
@@ -76,13 +82,16 @@ def s3_key(relative: str, prefix: str = None) -> str:
     return (S3_PREFIX if prefix is None else prefix) + "/".join(part for part in parts if part)
 
 
-def push(path: Path, root: Path) -> bool:
+def push(path: Path, root: Path, extra_args: dict = None) -> bool:
     """Upload `path` (under `root`) to S3 and delete it locally; True on success."""
     relative = path.relative_to(root).as_posix()
     key = s3_key(relative)
     size = path.stat().st_size
     try:
-        s3().upload_file(str(path), S3_BUCKET, key)
+        if extra_args:
+            s3().upload_file(str(path), S3_BUCKET, key, ExtraArgs=extra_args)
+        else:
+            s3().upload_file(str(path), S3_BUCKET, key)
     except Exception as exc:
         log.error("s3 upload failed file=%s bucket=%s key=%s: %s", relative, S3_BUCKET, key, exc)
         return False
@@ -131,6 +140,38 @@ def _progress_loop(stop: threading.Event):
             report_progress()
         except Exception:
             log.exception("progress sweep failed")
+
+
+def push_stale_incomplete(now: float = None) -> int:
+    """Push spool files untouched for INCOMPLETE_PUSH_AFTER seconds, marked partial.
+
+    Anything still in the spool is an upload in flight or one that broke off; a file
+    that has not changed for that long is not being written any more. Returns how many
+    were pushed. A failed push leaves the file for the next sweep.
+    """
+    if INCOMPLETE_PUSH_AFTER <= 0:
+        return 0
+    now = time.time() if now is None else now
+    pushed = 0
+    for path in sorted(SPOOL_DIR.rglob("*")):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:  # pushed and removed meanwhile
+            continue
+        if not path.is_file() or stat.st_size == 0 or now - stat.st_mtime < INCOMPLETE_PUSH_AFTER:
+            continue
+        log.warning("pushing incomplete upload untouched for %ds: %s", now - stat.st_mtime, path)
+        if push(path, SPOOL_DIR, {"Metadata": {"partial": "true"}}):
+            pushed += 1
+    return pushed
+
+
+def _incomplete_loop(stop: threading.Event):
+    while not stop.wait(min(INCOMPLETE_PUSH_AFTER, 30)):
+        try:
+            push_stale_incomplete()
+        except Exception:
+            log.exception("incomplete sweep failed")
 
 
 def retry_once():
@@ -186,6 +227,8 @@ if __name__ == "__main__":
     RETRY_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_retry_loop, args=(threading.Event(),), daemon=True).start()
     threading.Thread(target=_progress_loop, args=(threading.Event(),), daemon=True).start()
+    if INCOMPLETE_PUSH_AFTER > 0:
+        threading.Thread(target=_incomplete_loop, args=(threading.Event(),), daemon=True).start()
     log.info("ftp receiver on :%d passive=%s spool=%s -> s3://%s/%s",
              PORT, PASSIVE_PORTS, SPOOL_DIR, S3_BUCKET, S3_PREFIX)
     build_server().serve_forever()
