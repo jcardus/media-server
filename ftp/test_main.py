@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -69,6 +70,61 @@ class StaleIncompleteTest(unittest.TestCase):
     def test_a_file_still_being_written_is_left_alone(self):
         self.assertEqual(0, self.sweep(60, 10))
         self.assertTrue(self.file.exists())
+
+
+class ConvertImkhTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.spool = Path(directory.name) / "ftp"
+        self.file = self.spool / "062996769808" / "clip" / "ch02.mp4"
+        self.file.parent.mkdir(parents=True)
+        self.fake = FakeS3()
+        for name, value in (("SPOOL_DIR", self.spool), ("S3_BUCKET", "bucket"), ("_s3", self.fake),
+                            ("CONVERT_IMKH", True)):
+            old = getattr(main, name)
+            setattr(main, name, value)
+            self.addCleanup(setattr, main, name, old)
+        self.commands = []
+        original = main.subprocess.run
+        main.subprocess.run = self.fake_run
+        self.addCleanup(setattr, main.subprocess, "run", original)
+        self.ffmpeg_exit = 0
+
+    def fake_run(self, command, **kwargs):
+        self.commands.append(command)
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout="hevc\n", stderr="")
+        if self.ffmpeg_exit == 0:
+            Path(command[-1]).write_bytes(b"standard-mp4")
+        return subprocess.CompletedProcess(command, self.ffmpeg_exit, stdout="", stderr="boom")
+
+    def test_an_imkh_file_is_pushed_as_a_standard_mp4_under_the_same_key(self):
+        self.file.write_bytes(b"IMKH" + b"\0" * 40)
+        self.assertTrue(main.push(self.file, self.spool))
+        self.assertEqual([(b"standard-mp4", "bucket", "recordings/062996769808/clip/ch02.mp4")], self.fake.uploads)
+        self.assertFalse(self.file.exists())
+        ffmpeg = next(command for command in self.commands if command[0] == "ffmpeg")
+        self.assertIn("hvc1", ffmpeg)  # QuickTime needs the hvc1 tag on HEVC
+        self.assertFalse(Path(ffmpeg[-1]).exists())  # the temporary copy is gone
+
+    def test_other_files_are_not_converted(self):
+        self.file.write_bytes(b"\0\0\0\x20ftypisom")
+        self.assertTrue(main.push(self.file, self.spool))
+        self.assertEqual([b"\0\0\0\x20ftypisom"], [upload[0] for upload in self.fake.uploads])
+        self.assertEqual([], self.commands)
+
+    def test_the_original_is_pushed_when_ffmpeg_fails(self):
+        self.file.write_bytes(b"IMKH" + b"\0" * 40)
+        self.ffmpeg_exit = 1
+        self.assertTrue(main.push(self.file, self.spool))
+        self.assertEqual([b"IMKH" + b"\0" * 40], [upload[0] for upload in self.fake.uploads])
+
+    def test_conversion_can_be_turned_off(self):
+        main.CONVERT_IMKH = False
+        self.file.write_bytes(b"IMKH" + b"\0" * 40)
+        self.assertTrue(main.push(self.file, self.spool))
+        self.assertEqual([], self.commands)
 
 
 class ReceivedTest(unittest.TestCase):
